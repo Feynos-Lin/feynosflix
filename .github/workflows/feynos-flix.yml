@@ -295,6 +295,7 @@ jobs:
                   Prefs.init(this)
                   Session.restore()
                   Downloads.init(this)
+                  HomeCache.init(this)
               }
 
               override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
@@ -678,6 +679,288 @@ jobs:
           }
           FEYNOS_EOF
 
+      - name: Write Home.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/Home.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import android.content.Context
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.rememberLazyListState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.platform.LocalConfiguration
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.IOException
+
+          class HomeData(
+              val hero: Item?,
+              val rows: List<RowData>,
+              val genres: List<String>,
+              val loading: Boolean = false,
+              val fromDisk: Boolean = false
+          )
+
+          /** Keeps the last home screen in memory and on disk, so the app opens straight onto it. */
+          object HomeCache {
+              private lateinit var dir: File
+              private val mem = HashMap<String, HomeData>()
+
+              fun init(ctx: Context) {
+                  dir = File(ctx.cacheDir, "home").apply { mkdirs() }
+              }
+
+              private fun key(acc: String, filter: String?) = "$acc|${filter ?: "all"}"
+              private fun file(k: String) = File(dir, Integer.toHexString(k.hashCode()) + ".json")
+
+              fun memory(acc: String, filter: String?): HomeData? = mem[key(acc, filter)]
+
+              suspend fun disk(acc: String, filter: String?): HomeData? = withContext(Dispatchers.IO) {
+                  try {
+                      val f = file(key(acc, filter))
+                      if (!f.exists()) null else fromJson(JSONObject(f.readText()))
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              fun put(acc: String, filter: String?, d: HomeData) {
+                  val k = key(acc, filter)
+                  mem[k] = d
+                  val json = toJson(d).toString()
+                  appScope.launch(Dispatchers.IO) {
+                      try {
+                          file(k).writeText(json)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun toJson(d: HomeData): JSONObject {
+                  val rows = JSONArray()
+                  d.rows.forEach { r ->
+                      val items = JSONArray()
+                      r.items.forEach { items.put(it.j) }
+                      rows.put(
+                          JSONObject().put("key", r.key).put("title", r.title).put("style", r.style.name)
+                              .put("more", r.moreRoute ?: JSONObject.NULL).put("items", items)
+                      )
+                  }
+                  val genres = JSONArray()
+                  d.genres.forEach { genres.put(it) }
+                  return JSONObject().put("hero", d.hero?.j ?: JSONObject.NULL).put("genres", genres).put("rows", rows)
+              }
+
+              private fun fromJson(o: JSONObject): HomeData {
+                  val hero = o.optJSONObject("hero")?.let { Item(it) }
+                  val rows = o.optJSONArray("rows").objs().map { r ->
+                      RowData(
+                          r.optString("title"),
+                          r.optJSONArray("items").objs().map { Item(it) },
+                          runCatching { RowStyle.valueOf(r.optString("style")) }.getOrDefault(RowStyle.Poster),
+                          r.s("more"),
+                          r.optString("key")
+                      )
+                  }
+                  return HomeData(hero, rows, o.optJSONArray("genres").strs(), loading = false, fromDisk = true)
+              }
+          }
+
+          /**
+           * Loads every home row in parallel.
+           * First-ever load ([prev] is null): rows appear one by one as they arrive.
+           * Refresh: the screen keeps showing [prev] and swaps everything in once, so nothing jumps around.
+           */
+          suspend fun loadHome(filter: String?, prev: HomeData?, reshuffle: Boolean, emit: (HomeData) -> Unit) {
+              val types = filter ?: "Movie,Series"
+              val streaming = prev == null
+              val rows = HashMap<String, RowData>()
+              var latestKeys = listOf<String>()
+              var genreKeys = listOf<String>()
+              var hero: Item? = if (prev != null && !reshuffle && !prev.fromDisk) prev.hero else null
+              var genres: List<String> = if (prev != null && !reshuffle) prev.genres else emptyList()
+              var ok = 0
+              var failed = 0
+
+              fun ordered(): List<RowData> {
+                  val keys = listOf("continue", "next", "fav") + latestKeys.take(1) + listOf("top") + latestKeys.drop(1) + genreKeys
+                  return keys.mapNotNull { rows[it] }.filter { it.items.isNotEmpty() }
+              }
+
+              fun publish() {
+                  if (streaming) emit(HomeData(hero, ordered(), genres, loading = true))
+              }
+
+              suspend fun <T> safe(block: suspend () -> T): T? = try {
+                  block().also { ok++ }
+              } catch (e: CancellationException) {
+                  throw e
+              } catch (e: Exception) {
+                  failed++
+                  null
+              }
+
+              val card = mapOf("Fields" to Jf.CARD)
+
+              coroutineScope {
+                  fun row(key: String, title: String, style: RowStyle, more: String? = null, load: suspend () -> List<Item>) {
+                      launch {
+                          rows[key] = RowData(title, safe(load) ?: emptyList(), style, more, key)
+                          publish()
+                      }
+                  }
+
+                  if (hero == null) {
+                      launch {
+                          hero = safe {
+                              Jf.query(
+                                  mapOf("IncludeItemTypes" to types, "SortBy" to "Random", "Limit" to 1, "ImageTypes" to "Backdrop", "Fields" to "Genres"),
+                                  count = false
+                              ).first.firstOrNull()
+                          }
+                          publish()
+                      }
+                  }
+                  row("continue", "Continue Watching", RowStyle.Wide) {
+                      Jf.resume().filter {
+                          when (filter) {
+                              "Movie" -> it.type == "Movie"
+                              "Series" -> it.type == "Episode"
+                              else -> true
+                          }
+                      }
+                  }
+                  if (filter != "Movie") row("next", "Next Up", RowStyle.Wide) { Jf.nextUp(null, 20, false) }
+                  row("fav", "My List", RowStyle.Poster, browseRoute("My List", "fav", "_", "Movie,Series,Episode")) {
+                      Jf.query(card + mapOf("IncludeItemTypes" to types, "Filters" to "IsFavorite", "SortBy" to "DateCreated", "SortOrder" to "Descending", "Limit" to 30), count = false).first
+                  }
+                  row("top", "Top 10 on Your Server", RowStyle.Top10) {
+                      Jf.query(card + mapOf("IncludeItemTypes" to types, "SortBy" to "CommunityRating,SortName", "SortOrder" to "Descending", "Limit" to 10), count = false).first
+                  }
+                  launch {
+                      val views = (safe { Jf.views() } ?: emptyList()).filter { v ->
+                          when (filter) {
+                              "Movie" -> v.collectionType == "movies"
+                              "Series" -> v.collectionType == "tvshows"
+                              else -> v.collectionType in setOf("movies", "tvshows", "homevideos", "mixed", null)
+                          }
+                      }
+                      latestKeys = views.map { "latest:${it.id}" }
+                      views.forEach { v ->
+                          row("latest:${v.id}", "New in ${v.name}", RowStyle.Poster, browseRoute(v.name, "lib", v.id, libTypes(v))) { Jf.latest(v.id) }
+                      }
+                  }
+                  launch {
+                      if (genres.isEmpty()) genres = safe { Jf.genres(types).distinct().shuffled().take(6) } ?: emptyList()
+                      genreKeys = genres.map { "genre:$it" }
+                      genres.forEach { g ->
+                          row("genre:$g", g, RowStyle.Poster, browseRoute(g, "genre", g, types)) {
+                              Jf.query(card + mapOf("Genres" to g, "IncludeItemTypes" to types, "SortBy" to "Random", "Limit" to 20), count = false).first
+                          }
+                      }
+                  }
+              }
+
+              if (ok == 0 && failed > 0) throw IOException("Couldn't reach your Jellyfin server")
+              emit(HomeData(hero, ordered(), genres, loading = false))
+          }
+
+          @Composable
+          fun HomeSkeleton() {
+              val w = LocalConfiguration.current.screenWidthDp
+              Column(Modifier.fillMaxSize()) {
+                  Box(Modifier.fillMaxWidth().height(if (w >= 600) 380.dp else (w * 1.4f).dp).background(Surf.copy(alpha = 0.5f)))
+                  repeat(3) {
+                      Box(Modifier.padding(16.dp, 22.dp, 16.dp, 8.dp).width(140.dp).height(16.dp).clip(RoundedCornerShape(4.dp)).background(Surf))
+                      Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          repeat(5) { Box(Modifier.width(112.dp).height(168.dp).clip(RoundedCornerShape(6.dp)).background(Surf)) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun HomeScreen() {
+              var filter by rememberSaveable { mutableStateOf<String?>(null) }
+              var cats by remember { mutableStateOf(false) }
+              val acc = Session.account?.key ?: ""
+              var data by remember(filter, acc) { mutableStateOf(HomeCache.memory(acc, filter)) }
+              var error by remember(filter, acc) { mutableStateOf<String?>(null) }
+              var refreshing by remember { mutableStateOf(false) }
+              var pulls by remember { mutableIntStateOf(0) }
+              val tick = Session.tick
+
+              LaunchedEffect(filter, acc, tick, pulls) {
+                  if (data == null) data = HomeCache.disk(acc, filter)
+                  try {
+                      loadHome(filter, data, reshuffle = refreshing) { data = it }
+                      data?.let { HomeCache.put(acc, filter, it) }
+                      error = null
+                  } catch (e: CancellationException) {
+                      throw e
+                  } catch (e: Exception) {
+                      if (data == null) error = e.message ?: "Couldn't load"
+                  }
+                  refreshing = false
+              }
+
+              val listState = rememberLazyListState()
+              val solid by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 300 } }
+
+              Box(Modifier.fillMaxSize().background(Bg)) {
+                  PullToRefreshBox(
+                      isRefreshing = refreshing,
+                      onRefresh = {
+                          refreshing = true
+                          pulls++
+                      },
+                      modifier = Modifier.fillMaxSize()
+                  ) {
+                      val d = data
+                      when {
+                          d != null -> LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                              item(key = "hero") {
+                                  val hero = d.hero
+                                  when {
+                                      hero != null -> Hero(hero)
+                                      d.loading -> Box(
+                                          Modifier.fillMaxWidth()
+                                              .height(if (LocalConfiguration.current.screenWidthDp >= 600) 380.dp else (LocalConfiguration.current.screenWidthDp * 1.4f).dp)
+                                              .background(Surf.copy(alpha = 0.5f))
+                                      )
+                                      else -> Spacer(Modifier.statusBarsPadding().height(110.dp))
+                                  }
+                              }
+                              items(d.rows, key = { it.key }) { RowSection(it) }
+                              item(key = "end") { Spacer(Modifier.height(24.dp)) }
+                          }
+                          error != null -> ErrorBox(error ?: "")
+                          else -> HomeSkeleton()
+                      }
+                  }
+                  HomeTopBar(filter, solid, onFilter = { filter = it }, onCats = { cats = true })
+              }
+              if (cats) CategoriesDialog(filter ?: "Movie,Series") { cats = false }
+          }
+          FEYNOS_EOF
+
       - name: Write Jellyfin.kt
         run: |
           set -e
@@ -779,6 +1062,8 @@ jobs:
 
           object Jf {
               private const val LIGHT = "Overview,Genres,PrimaryImageAspectRatio,SeriesPrimaryImageTag,ChildCount,DateCreated"
+              /** Just enough for a poster or thumbnail card — keeps list responses small and fast. */
+              const val CARD = "PrimaryImageAspectRatio"
               private val JSON_TYPE = "application/json".toMediaType()
 
               private val http = OkHttpClient.Builder()
@@ -898,9 +1183,9 @@ jobs:
 
               suspend fun views(): List<Item> = items(get("/UserViews", mapOf("userId" to uid)))
 
-              suspend fun query(params: Map<String, Any?>): Pair<List<Item>, Int> {
+              suspend fun query(params: Map<String, Any?>, count: Boolean = true): Pair<List<Item>, Int> {
                   val base = mapOf<String, Any?>(
-                      "userId" to uid, "Recursive" to true, "Fields" to LIGHT, "EnableTotalRecordCount" to true,
+                      "userId" to uid, "Recursive" to true, "Fields" to LIGHT, "EnableTotalRecordCount" to count,
                       "ImageTypeLimit" to 1, "EnableImageTypes" to "Primary,Backdrop,Thumb,Logo"
                   )
                   val o = get("/Items", base + params)
@@ -908,15 +1193,15 @@ jobs:
               }
 
               suspend fun latest(parentId: String?, limit: Int = 24): List<Item> =
-                  getArr("/Items/Latest", mapOf("userId" to uid, "ParentId" to parentId, "Limit" to limit, "Fields" to LIGHT, "GroupItems" to true))
+                  getArr("/Items/Latest", mapOf("userId" to uid, "ParentId" to parentId, "Limit" to limit, "Fields" to CARD, "GroupItems" to true, "ImageTypeLimit" to 1))
                       .objs().map { Item(it) }
 
               suspend fun resume(limit: Int = 20): List<Item> = items(
-                  get("/UserItems/Resume", mapOf("userId" to uid, "Limit" to limit, "MediaTypes" to "Video", "Fields" to LIGHT, "EnableImageTypes" to "Primary,Backdrop,Thumb"))
+                  get("/UserItems/Resume", mapOf("userId" to uid, "Limit" to limit, "MediaTypes" to "Video", "Fields" to CARD, "ImageTypeLimit" to 1, "EnableImageTypes" to "Primary,Backdrop,Thumb"))
               )
 
               suspend fun nextUp(seriesId: String?, limit: Int, resumable: Boolean): List<Item> = items(
-                  get("/Shows/NextUp", mapOf("userId" to uid, "SeriesId" to seriesId, "Limit" to limit, "Fields" to LIGHT, "EnableResumable" to resumable))
+                  get("/Shows/NextUp", mapOf("userId" to uid, "SeriesId" to seriesId, "Limit" to limit, "Fields" to CARD, "ImageTypeLimit" to 1, "EnableResumable" to resumable))
               )
 
               suspend fun item(id: String): Item = Item(get("/Items/$id", mapOf("userId" to uid)))
@@ -2661,105 +2946,6 @@ jobs:
           import kotlinx.coroutines.launch
           import java.io.File
 
-          // ======================= HOME =======================
-
-          class HomeData(val hero: Item?, val rows: List<RowData>)
-
-          suspend fun loadHome(filter: String?): HomeData = coroutineScope {
-              val types = filter ?: "Movie,Series"
-              val viewsD = async { runCatching { Jf.views() }.getOrDefault(emptyList()) }
-              val resumeD = async { runCatching { Jf.resume() }.getOrDefault(emptyList()) }
-              val nextD = async { if (filter == "Movie") emptyList() else runCatching { Jf.nextUp(null, 20, false) }.getOrDefault(emptyList()) }
-              val heroD = async {
-                  runCatching {
-                      Jf.query(mapOf("IncludeItemTypes" to types, "SortBy" to "Random", "Limit" to 1, "ImageTypes" to "Backdrop")).first.firstOrNull()
-                  }.getOrNull()
-              }
-              val favD = async {
-                  runCatching {
-                      Jf.query(mapOf("IncludeItemTypes" to types, "Filters" to "IsFavorite", "SortBy" to "DateCreated", "SortOrder" to "Descending", "Limit" to 30)).first
-                  }.getOrDefault(emptyList())
-              }
-              val topD = async {
-                  runCatching {
-                      Jf.query(mapOf("IncludeItemTypes" to types, "SortBy" to "CommunityRating,SortName", "SortOrder" to "Descending", "Limit" to 10)).first
-                  }.getOrDefault(emptyList())
-              }
-              val genresD = async { runCatching { Jf.genres(types).shuffled().take(6) }.getOrDefault(emptyList()) }
-
-              val views = viewsD.await().filter { v ->
-                  when (filter) {
-                      "Movie" -> v.collectionType == "movies"
-                      "Series" -> v.collectionType == "tvshows"
-                      else -> v.collectionType in setOf("movies", "tvshows", "homevideos", "mixed", null)
-                  }
-              }
-              val latestD = views.map { v ->
-                  async {
-                      RowData("New in ${v.name}", runCatching { Jf.latest(v.id) }.getOrDefault(emptyList()), RowStyle.Poster,
-                          browseRoute(v.name, "lib", v.id, libTypes(v)))
-                  }
-              }
-              val genreD = genresD.await().map { g ->
-                  async {
-                      RowData(g, runCatching {
-                          Jf.query(mapOf("Genres" to g, "IncludeItemTypes" to types, "SortBy" to "Random", "Limit" to 20)).first
-                      }.getOrDefault(emptyList()), RowStyle.Poster, browseRoute(g, "genre", g, types))
-                  }
-              }
-              val resume = resumeD.await().filter {
-                  when (filter) {
-                      "Movie" -> it.type == "Movie"
-                      "Series" -> it.type == "Episode"
-                      else -> true
-                  }
-              }
-              val latest = latestD.awaitAll()
-              val genreRows = genreD.awaitAll()
-              val rows = buildList {
-                  add(RowData("Continue Watching", resume, RowStyle.Wide))
-                  add(RowData("Next Up", nextD.await(), RowStyle.Wide))
-                  add(RowData("My List", favD.await(), RowStyle.Poster, browseRoute("My List", "fav", "_", "Movie,Series,Episode")))
-                  latest.firstOrNull()?.let { add(it) }
-                  add(RowData("Top 10 on Your Server", topD.await(), RowStyle.Top10))
-                  latest.drop(1).forEach { add(it) }
-                  genreRows.forEach { add(it) }
-              }
-              HomeData(heroD.await(), rows.filter { it.items.isNotEmpty() })
-          }
-
-          @Composable
-          fun HomeScreen() {
-              var filter by rememberSaveable { mutableStateOf<String?>(null) }
-              var cats by remember { mutableStateOf(false) }
-              var refreshing by remember { mutableStateOf(false) }
-              val data by rememberLoad(filter) { loadHome(filter) }
-              LaunchedEffect(data) { if (data != Res.Loading) refreshing = false }
-              val listState = rememberLazyListState()
-              val solid by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 300 } }
-
-              Box(Modifier.fillMaxSize().background(Bg)) {
-                  PullToRefreshBox(
-                      isRefreshing = refreshing,
-                      onRefresh = { refreshing = true; Session.tick++ },
-                      modifier = Modifier.fillMaxSize()
-                  ) {
-                      Loaded(data) { d ->
-                          LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                              item {
-                                  val hero = d.hero
-                                  if (hero != null) Hero(hero) else Spacer(Modifier.statusBarsPadding().height(110.dp))
-                              }
-                              items(d.rows) { RowSection(it) }
-                              item { Spacer(Modifier.height(24.dp)) }
-                          }
-                      }
-                  }
-                  HomeTopBar(filter, solid, onFilter = { filter = it }, onCats = { cats = true })
-              }
-              if (cats) CategoriesDialog(filter ?: "Movie,Series") { cats = false }
-          }
-
           @Composable
           fun HomeTopBar(filter: String?, solid: Boolean, onFilter: (String?) -> Unit, onCats: () -> Unit) {
               val nav = LocalNav.current
@@ -2901,7 +3087,7 @@ jobs:
 
           @Composable
           fun DetailScreen(id: String) {
-              val r by rememberLoad(id) { Jf.item(id) }
+              val r by rememberLoad(id, cacheKey = "item:$id") { Jf.item(id) }
               Box(Modifier.fillMaxSize().background(Bg)) {
                   Loaded(r) { DetailContent(it) }
                   BackCircle()
@@ -2919,9 +3105,9 @@ jobs:
 
               var fav by remember(item) { mutableStateOf(item.favorite) }
               var watched by remember(item) { mutableStateOf(item.played) }
-              val seasonsR by rememberLoad(item.id) { if (isSeries) Jf.seasons(item.id) else emptyList() }
+              val seasonsR by rememberLoad(item.id, cacheKey = "seasons:${item.id}") { if (isSeries) Jf.seasons(item.id) else emptyList() }
               val nextUpR by rememberLoad(item.id) { if (isSeries) Jf.nextUp(item.id, 1, true).firstOrNull() else null }
-              val similarR by rememberLoad(item.id) { Jf.similar(item.id) }
+              val similarR by rememberLoad(item.id, cacheKey = "similar:${item.id}") { Jf.similar(item.id) }
               val seasons = seasonsR.orNull() ?: emptyList()
               val nextUp = nextUpR.orNull()
               var seasonIdx by rememberSaveable(item.id) { mutableIntStateOf(-1) }
@@ -2933,7 +3119,7 @@ jobs:
                   }
               }
               val season = seasons.getOrNull(seasonIdx)
-              val episodesR by rememberLoad(season?.id) { if (season != null) Jf.episodes(item.id, season.id) else emptyList() }
+              val episodesR by rememberLoad(season?.id, cacheKey = "eps:${season?.id}") { if (season != null) Jf.episodes(item.id, season.id) else emptyList() }
               val tabs = buildList {
                   if (isSeries) add("Episodes")
                   add("More Like This")
@@ -3241,6 +3427,7 @@ jobs:
                               "Limit" to 60
                           )
                           if (genre != null) extra["Genres"] = genre
+                          extra["Fields"] = Jf.CARD
                           val (l, t) = Jf.query(base + extra)
                           list.addAll(l)
                           total = t
@@ -3552,10 +3739,10 @@ jobs:
               val ctx = LocalContext.current
               val scope = rememberCoroutineScope()
               val acc = Session.account ?: return
-              val favR by rememberLoad {
+              val favR by rememberLoad(cacheKey = "fav") {
                   Jf.query(mapOf("Filters" to "IsFavorite", "IncludeItemTypes" to "Movie,Series,Episode", "SortBy" to "DateCreated", "SortOrder" to "Descending", "Limit" to 30)).first
               }
-              val viewsR by rememberLoad { Jf.views() }
+              val viewsR by rememberLoad(cacheKey = "views") { Jf.views() }
               var checking by remember { mutableStateOf(false) }
               val rowColors = ListItemDefaults.colors(containerColor = Bg)
 
@@ -3826,19 +4013,48 @@ jobs:
           @Suppress("UNCHECKED_CAST")
           fun <T> Res<T>.orNull(): T? = (this as? Res.Ok<T>)?.v
 
-          /** Loads data off the UI, reloading when [keys] change or the app asks for a refresh. Keeps old data while reloading. */
+          /** Small in-memory cache so revisiting a screen shows its last data instantly. */
+          object MemCache {
+              private val map = object : LinkedHashMap<String, Any>(64, 0.75f, true) {
+                  override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Any>?): Boolean = size > 60
+              }
+
+              @Synchronized
+              fun get(k: String): Any? = map[k]
+
+              @Synchronized
+              fun put(k: String, v: Any) {
+                  map[k] = v
+              }
+          }
+
+          /**
+           * Loads data off the UI, reloading when [keys] change or the app asks for a refresh.
+           * Refreshes happen silently: whatever is already on screen stays there until new data arrives.
+           * With [cacheKey], the last result is also shown immediately the next time the screen opens.
+           */
           @Composable
-          fun <T> rememberLoad(vararg keys: Any?, block: suspend () -> T): State<Res<T>> {
+          fun <T> rememberLoad(vararg keys: Any?, cacheKey: String? = null, block: suspend () -> T): State<Res<T>> {
+              val acc = Session.account?.key
+              val ck = cacheKey?.let { "$acc|$it" }
+              val state = remember(*keys, acc) {
+                  @Suppress("UNCHECKED_CAST")
+                  val cached = ck?.let { MemCache.get(it) } as? Res.Ok<T>
+                  mutableStateOf<Res<T>>(cached ?: Res.Loading)
+              }
               val tick = Session.tick
-              return produceState<Res<T>>(Res.Loading, *keys, tick) {
-                  value = try {
-                      Res.Ok(block())
+              LaunchedEffect(*keys, acc, tick) {
+                  try {
+                      val ok = Res.Ok(block())
+                      state.value = ok
+                      if (ck != null) MemCache.put(ck, ok)
                   } catch (e: CancellationException) {
                       throw e
                   } catch (e: Exception) {
-                      Res.Err(e)
+                      if (state.value !is Res.Ok) state.value = Res.Err(e)
                   }
               }
+              return state
           }
 
           @Composable
@@ -4015,7 +4231,7 @@ jobs:
 
           enum class RowStyle { Poster, Wide, Top10 }
 
-          class RowData(val title: String, val items: List<Item>, val style: RowStyle, val moreRoute: String? = null)
+          class RowData(val title: String, val items: List<Item>, val style: RowStyle, val moreRoute: String? = null, val key: String = title)
 
           @Composable
           fun RowSection(r: RowData) {
