@@ -458,6 +458,26 @@ jobs:
                   get() = sp.getInt("comicSpread", 0)
                   set(v) { sp.edit().putInt("comicSpread", v).apply() }
 
+              var epubTheme: Int
+                  get() = sp.getInt("epubTheme", 2)
+                  set(v) { sp.edit().putInt("epubTheme", v).apply() }
+
+              var epubSize: Int
+                  get() = sp.getInt("epubSize", 100)
+                  set(v) { sp.edit().putInt("epubSize", v).apply() }
+
+              var epubFont: Int
+                  get() = sp.getInt("epubFont", 0)
+                  set(v) { sp.edit().putInt("epubFont", v).apply() }
+
+              var epubLine: Int
+                  get() = sp.getInt("epubLine", 1)
+                  set(v) { sp.edit().putInt("epubLine", v).apply() }
+
+              var epubMargin: Int
+                  get() = sp.getInt("epubMargin", 1)
+                  set(v) { sp.edit().putInt("epubMargin", v).apply() }
+
               fun bitrateOf(b: Int): Int = if (b <= 0) 200_000_000 else b
           }
           FEYNOS_EOF
@@ -1651,6 +1671,291 @@ jobs:
           }
           FEYNOS_EOF
 
+      - name: Write Epub.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/Epub.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import android.net.Uri
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import org.w3c.dom.Element
+          import org.w3c.dom.Node
+          import java.io.File
+          import java.io.IOException
+          import java.io.InputStream
+          import java.util.zip.ZipFile
+          import javax.xml.parsers.DocumentBuilderFactory
+
+          class TocEntry(val title: String, val spine: Int, val fragment: String?, val level: Int)
+
+          class EpubBook(
+              private val zip: ZipFile,
+              val title: String?,
+              val author: String?,
+              /** Zip paths of the chapters, in reading order. */
+              val spine: List<String>,
+              val toc: List<TocEntry>,
+              private val mimes: Map<String, String>,
+              private val sizes: List<Long>
+          ) {
+              private val total: Double = sizes.sum().coerceAtLeast(1L).toDouble()
+              private val before: List<Double>
+
+              init {
+                  var run = 0.0
+                  before = sizes.map { s -> run.also { run += s } }
+              }
+
+              fun open(path: String): InputStream? {
+                  val e = zip.getEntry(path) ?: zip.getEntry(Uri.decode(path)) ?: return null
+                  return zip.getInputStream(e)
+              }
+
+              fun mimeOf(path: String): String {
+                  mimes[path]?.let { return it }
+                  return when (path.substringAfterLast('.', "").lowercase()) {
+                      "xhtml", "xml" -> "application/xhtml+xml"
+                      "html", "htm" -> "text/html"
+                      "css" -> "text/css"
+                      "jpg", "jpeg" -> "image/jpeg"
+                      "png" -> "image/png"
+                      "gif" -> "image/gif"
+                      "webp" -> "image/webp"
+                      "svg" -> "image/svg+xml"
+                      "ttf" -> "font/ttf"
+                      "otf" -> "font/otf"
+                      "woff" -> "font/woff"
+                      "woff2" -> "font/woff2"
+                      else -> "application/octet-stream"
+                  }
+              }
+
+              /** How far through the whole book you are, weighting chapters by their size. */
+              fun overall(chapter: Int, fraction: Double): Float {
+                  val i = chapter.coerceIn(0, spine.size - 1)
+                  return ((before[i] + sizes[i] * fraction.coerceIn(0.0, 1.0)) / total).toFloat().coerceIn(0f, 1f)
+              }
+
+              /** The inverse of [overall]: which chapter, and how far into it. */
+              fun locate(overall: Float): Pair<Int, Double> {
+                  val target = overall.coerceIn(0f, 1f) * total
+                  var i = before.indexOfLast { it <= target }.coerceAtLeast(0)
+                  if (i >= spine.size) i = spine.size - 1
+                  val frac = if (sizes[i] > 0) ((target - before[i]) / sizes[i]).coerceIn(0.0, 1.0) else 0.0
+                  return i to frac
+              }
+
+              fun chapterTitle(index: Int): String? =
+                  toc.lastOrNull { it.spine <= index }?.title
+
+              fun close() {
+                  try {
+                      zip.close()
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+
+          object Epubs {
+              suspend fun open(file: File): EpubBook = withContext(Dispatchers.IO) { parse(file) }
+
+              private fun doc(zip: ZipFile, path: String): org.w3c.dom.Document {
+                  val e = zip.getEntry(path) ?: throw IOException("This EPUB is damaged (missing $path).")
+                  val f = DocumentBuilderFactory.newInstance().apply {
+                      isNamespaceAware = true
+                      isValidating = false
+                      try {
+                          setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+                      } catch (ex: Exception) {
+                      }
+                  }
+                  return zip.getInputStream(e).use { f.newDocumentBuilder().parse(it) }
+              }
+
+              private fun resolve(base: String, href: String): String {
+                  val clean = Uri.decode(href.substringBefore('#').substringBefore('?'))
+                  val parts = ArrayList<String>()
+                  val all = if (base.isEmpty()) clean else "$base/$clean"
+                  for (p in all.split('/')) {
+                      when (p) {
+                          "", "." -> {}
+                          ".." -> if (parts.isNotEmpty()) parts.removeAt(parts.size - 1)
+                          else -> parts.add(p)
+                      }
+                  }
+                  return parts.joinToString("/")
+              }
+
+              private fun kids(n: Node, name: String): List<Element> {
+                  val out = ArrayList<Element>()
+                  var c = n.firstChild
+                  while (c != null) {
+                      if (c is Element && (c.localName ?: c.nodeName).substringAfter(':') == name) out.add(c)
+                      c = c.nextSibling
+                  }
+                  return out
+              }
+
+              private fun all(d: org.w3c.dom.Document, name: String): List<Element> {
+                  val nl = d.getElementsByTagNameNS("*", name)
+                  return (0 until nl.length).mapNotNull { nl.item(it) as? Element }
+              }
+
+              private fun text(e: Element?): String = e?.textContent?.replace(Regex("\\s+"), " ")?.trim() ?: ""
+
+              private fun parse(file: File): EpubBook {
+                  val zip = ZipFile(file)
+                  try {
+                      val container = doc(zip, "META-INF/container.xml")
+                      val opfPath = all(container, "rootfile").firstOrNull()?.getAttribute("full-path")?.takeIf { it.isNotBlank() }
+                          ?: throw IOException("This EPUB is damaged (no package file).")
+                      val base = opfPath.substringBeforeLast('/', "")
+                      val opf = doc(zip, opfPath)
+
+                      val title = text(all(opf, "title").firstOrNull()).ifBlank { null }
+                      val author = text(all(opf, "creator").firstOrNull()).ifBlank { null }
+
+                      class ManifestItem(val href: String, val type: String, val props: String)
+                      val manifest = HashMap<String, ManifestItem>()
+                      val mimes = HashMap<String, String>()
+                      all(opf, "item").forEach { e ->
+                          val id = e.getAttribute("id")
+                          val href = e.getAttribute("href")
+                          if (id.isNotBlank() && href.isNotBlank()) {
+                              val path = resolve(base, href)
+                              manifest[id] = ManifestItem(path, e.getAttribute("media-type"), e.getAttribute("properties"))
+                              if (e.getAttribute("media-type").isNotBlank()) mimes[path] = e.getAttribute("media-type")
+                          }
+                      }
+                      val spineEl = all(opf, "spine").firstOrNull() ?: throw IOException("This EPUB has no reading order.")
+                      val spine = kids(spineEl, "itemref").mapNotNull { manifest[it.getAttribute("idref")]?.href }
+                          .filter { zip.getEntry(it) != null }
+                      if (spine.isEmpty()) throw IOException("This EPUB has no readable chapters.")
+                      val sizes = spine.map { zip.getEntry(it)?.size?.takeIf { s -> s > 0 } ?: 1L }
+                      val indexOf = HashMap<String, Int>()
+                      spine.forEachIndexed { i, p -> indexOf.putIfAbsent(p, i) }
+
+                      val toc = ArrayList<TocEntry>()
+                      fun add(title: String, href: String, navBase: String, level: Int) {
+                          if (title.isBlank()) return
+                          val path = resolve(navBase, href)
+                          val idx = indexOf[path] ?: return
+                          val frag = href.substringAfter('#', "").ifBlank { null }
+                          toc.add(TocEntry(title, idx, frag?.let { Uri.decode(it) }, level))
+                      }
+
+                      // EPUB 3 navigation document
+                      val navItem = manifest.values.firstOrNull { it.props.split(' ').contains("nav") }
+                      if (navItem != null && zip.getEntry(navItem.href) != null) {
+                          try {
+                              val nd = doc(zip, navItem.href)
+                              val navBase = navItem.href.substringBeforeLast('/', "")
+                              val navs = all(nd, "nav")
+                              val tocNav = navs.firstOrNull { (it.getAttributeNS("http://www.idpf.org/2007/ops", "type") + it.getAttribute("epub:type")).contains("toc") }
+                                  ?: navs.firstOrNull()
+                              fun walk(ol: Element, level: Int) {
+                                  for (li in kids(ol, "li")) {
+                                      val a = kids(li, "a").firstOrNull()
+                                      val label = kids(li, "span").firstOrNull()
+                                      if (a != null) add(text(a), a.getAttribute("href"), navBase, level)
+                                      else if (label != null) { /* heading without a link */ }
+                                      kids(li, "ol").forEach { walk(it, level + 1) }
+                                  }
+                              }
+                              tocNav?.let { n -> kids(n, "ol").forEach { walk(it, 0) } }
+                          } catch (e: Exception) {
+                              toc.clear()
+                          }
+                      }
+                      // EPUB 2 NCX
+                      if (toc.isEmpty()) {
+                          val ncxId = spineEl.getAttribute("toc")
+                          val ncx = manifest[ncxId] ?: manifest.values.firstOrNull { it.type == "application/x-dtbncx+xml" }
+                          if (ncx != null && zip.getEntry(ncx.href) != null) {
+                              try {
+                                  val nd = doc(zip, ncx.href)
+                                  val navBase = ncx.href.substringBeforeLast('/', "")
+                                  fun walk(parent: Element, level: Int) {
+                                      for (p in kids(parent, "navPoint")) {
+                                          val label = text(kids(p, "navLabel").firstOrNull()?.let { kids(it, "text").firstOrNull() })
+                                          val src = kids(p, "content").firstOrNull()?.getAttribute("src") ?: ""
+                                          if (src.isNotBlank()) add(label, src, navBase, level)
+                                          walk(p, level + 1)
+                                      }
+                                  }
+                                  all(nd, "navMap").firstOrNull()?.let { walk(it, 0) }
+                              } catch (e: Exception) {
+                                  toc.clear()
+                              }
+                          }
+                      }
+                      return EpubBook(zip, title, author, spine, toc, mimes, sizes)
+                  } catch (e: Throwable) {
+                      try {
+                          zip.close()
+                      } catch (ex: Exception) {
+                      }
+                      throw if (e is IOException) e else IOException("Couldn't read this EPUB (${e.message ?: e.javaClass.simpleName}).")
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+      - name: Write EpubJs.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/EpubJs.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          /** Small script injected into every chapter: lays the text out in page-sized columns and scrolls between them. */
+          object EpubJs {
+              val LIB = """
+          (function () {
+            if (window.fx) return;
+            window.fx = {
+              W: 0, n: 1, px: 0,
+              apply: function (c) {
+                var d = document, W = window.innerWidth, H = window.innerHeight;
+                var px = Math.round(c.padX * (W > 700 ? 1.6 : 1)), py = c.padY;
+                var cw = W - 2 * px, ch = H - 2 * py;
+                this.px = px;
+                var st = d.getElementById('fx-style');
+                if (!st) { st = d.createElement('style'); st.id = 'fx-style'; (d.head || d.documentElement).appendChild(st); }
+                var css = '';
+                css += 'html{margin:0!important;padding:0!important;overflow:hidden!important;width:' + W + 'px!important;height:' + H + 'px!important;background:' + c.bg + '!important;}';
+                css += 'body{margin:0!important;padding:' + py + 'px ' + px + 'px!important;box-sizing:content-box!important;width:' + cw + 'px!important;height:' + ch + 'px!important;column-width:' + cw + 'px!important;column-gap:' + (2 * px) + 'px!important;column-fill:auto!important;overflow:visible!important;background:transparent!important;position:static!important;}';
+                css += 'body,body *{color:' + c.fg + '!important;background-color:transparent!important;' + (c.line ? 'line-height:' + c.line + '!important;' : '') + (c.font ? 'font-family:' + c.font + '!important;' : '') + '}';
+                css += 'a,a *{color:' + c.link + '!important;}';
+                css += 'img,svg,video{max-width:100%!important;max-height:' + ch + 'px!important;object-fit:contain;}';
+                css += 'img{display:block;margin-left:auto;margin-right:auto;}';
+                css += 'p,li,blockquote{orphans:2;widows:2;}h1,h2,h3{break-after:avoid;}pre{white-space:pre-wrap!important;}';
+                st.textContent = css;
+                return this.measure();
+              },
+              measure: function () {
+                var W = window.innerWidth, r = document.documentElement, b = document.body;
+                var sw = Math.max(r.scrollWidth, b ? b.scrollWidth : 0);
+                this.W = W;
+                this.n = Math.max(1, Math.round((sw + this.px) / W));
+                return this.n;
+              },
+              go: function (p) { window.scrollTo(Math.max(0, p) * (this.W || window.innerWidth), 0); return p; },
+              anchor: function (id) {
+                var el = document.getElementById(id) || document.getElementsByName(id)[0];
+                if (!el) return 0;
+                var r = el.getBoundingClientRect();
+                return Math.max(0, Math.floor((r.left + window.scrollX) / (this.W || window.innerWidth)));
+              }
+            };
+          })();
+          """.trimIndent()
+          }
+          FEYNOS_EOF
+
       - name: Write EpubReader.kt
         run: |
           set -e
@@ -1658,20 +1963,538 @@ jobs:
           cat > 'flix/app/src/main/java/com/feynos/flix/EpubReader.kt' <<'FEYNOS_EOF'
           package com.feynos.flix
 
-          import androidx.compose.runtime.Composable
-          import java.io.File
-          import java.io.IOException
+          import android.annotation.SuppressLint
+          import android.view.View
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.compose.animation.AnimatedVisibility
+          import androidx.compose.animation.fadeIn
+          import androidx.compose.animation.fadeOut
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.TextFields
+          import androidx.compose.material.icons.filled.Toc
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.compose.ui.window.Dialog
+          import kotlinx.coroutines.delay
 
-          class EpubBook {
-              fun close() {}
-          }
+          @SuppressLint("SetJavaScriptEnabled")
+          @Composable
+          fun EpubReader(info: BookInfo, book: EpubBook, next: NextBook?, onClose: () -> Unit, onOpenNext: (String) -> Unit) {
+              val st = remember { EpubState(book, info) }
+              var controls by remember { mutableStateOf(true) }
+              var showToc by remember { mutableStateOf(false) }
+              var showSettings by remember { mutableStateOf(false) }
+              var scrub by remember { mutableStateOf<Float?>(null) }
+              val chrome = Color.White
 
-          object Epubs {
-              suspend fun open(file: File): EpubBook = throw IOException("EPUB reading isn't ready yet.")
+              LaunchedEffect(Unit) {
+                  delay(2500)
+                  controls = false
+              }
+
+              // Remember where you are: on this phone shortly after each page turn, and on the server every so often and on exit.
+              fun commit(syncServer: Boolean) {
+                  if (st.loading) return
+                  val finished = st.atVeryEnd
+                  val frac = st.pg.toDouble() / st.pc.coerceAtLeast(1)
+                  val pct = st.overall
+                  Books.save(info.id, st.ci, frac, pct, book.spine.size)
+                  if (syncServer && !info.offline) Books.syncToServer(info.id, st.ci, frac, finished)
+              }
+              LaunchedEffect(st.ci, st.pg, st.pc, st.loading) {
+                  delay(900)
+                  commit(false)
+              }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      delay(30_000)
+                      commit(true)
+                  }
+              }
+              DisposableEffect(Unit) {
+                  onDispose {
+                      commit(true)
+                      st.web?.let {
+                          it.stopLoading()
+                          it.destroy()
+                      }
+                      st.web = null
+                  }
+              }
+
+              Box(Modifier.fillMaxSize().background(Color(st.palette.bg))) {
+                  AndroidView(
+                      modifier = Modifier.fillMaxSize(),
+                      factory = { ctx ->
+                          WebView(ctx).apply {
+                              settings.javaScriptEnabled = true
+                              settings.allowFileAccess = false
+                              settings.allowContentAccess = false
+                              settings.domStorageEnabled = false
+                              settings.setSupportZoom(false)
+                              settings.builtInZoomControls = false
+                              settings.textZoom = st.fontSize
+                              isVerticalScrollBarEnabled = false
+                              isHorizontalScrollBarEnabled = false
+                              overScrollMode = View.OVER_SCROLL_NEVER
+                              setBackgroundColor(st.palette.bg)
+                              setOnLongClickListener { true }
+                              isLongClickable = false
+                              webViewClient = object : WebViewClient() {
+                                  override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse =
+                                      st.serve(request)
+
+                                  override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
+
+                                  override fun onPageFinished(view: WebView, url: String?) {
+                                      st.onLoaded(view)
+                                  }
+                              }
+                              addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                                  if ((right - left) != (oldRight - oldLeft) || (bottom - top) != (oldBottom - oldTop)) st.reapply()
+                              }
+                              st.web = this
+                              st.start()
+                          }
+                      }
+                  )
+
+                  // Invisible layer on top: taps turn pages, swipes turn pages, the middle shows the controls.
+                  Box(
+                      Modifier.fillMaxSize()
+                          .pointerInput(Unit) {
+                              detectTapGestures { o ->
+                                  val x = o.x / size.width
+                                  when {
+                                      x < 0.28f -> st.prev()
+                                      x > 0.72f -> st.next()
+                                      else -> controls = !controls
+                                  }
+                              }
+                          }
+                          .pointerInput(Unit) {
+                              var dx = 0f
+                              val threshold = 56.dp.toPx()
+                              detectHorizontalDragGestures(
+                                  onDragStart = { dx = 0f },
+                                  onDragEnd = {
+                                      if (dx < -threshold) st.next() else if (dx > threshold) st.prev()
+                                      dx = 0f
+                                  },
+                                  onDragCancel = { dx = 0f }
+                              ) { change, amount ->
+                                  dx += amount
+                                  change.consume()
+                              }
+                          }
+                  )
+
+                  if (st.loading) {
+                      CircularProgressIndicator(Modifier.align(Alignment.Center), color = Purple)
+                  }
+
+                  AnimatedVisibility(visible = controls, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter)) {
+                      Row(
+                          Modifier.fillMaxWidth()
+                              .background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.85f), Color.Transparent)))
+                              .statusBarsPadding().padding(horizontal = 4.dp, vertical = 4.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = chrome) }
+                          Column(Modifier.weight(1f)) {
+                              Text(book.title ?: info.title, color = chrome, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                              (book.chapterTitle(st.ci) ?: book.author)?.let {
+                                  Text(it, color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                              }
+                          }
+                          IconButton(onClick = { showToc = true }) { Icon(Icons.Filled.Toc, "Contents", tint = chrome) }
+                          IconButton(onClick = { showSettings = true }) { Icon(Icons.Filled.TextFields, "Text settings", tint = chrome) }
+                      }
+                  }
+
+                  AnimatedVisibility(visible = controls, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.BottomCenter)) {
+                      Column(
+                          Modifier.fillMaxWidth()
+                              .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.85f))))
+                              .navigationBarsPadding().padding(horizontal = 20.dp, vertical = 8.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally
+                      ) {
+                          val shown = scrub ?: st.overall
+                          Text("${(shown * 100).toInt()}%  ·  page ${st.pg + 1} of ${st.pc} in this chapter", color = chrome, fontSize = 13.sp)
+                          Slider(
+                              value = shown,
+                              onValueChange = { scrub = it },
+                              onValueChangeFinished = {
+                                  scrub?.let { st.seekOverall(it) }
+                                  scrub = null
+                              },
+                              colors = SliderDefaults.colors(thumbColor = Purple, activeTrackColor = Purple, inactiveTrackColor = Color.White.copy(alpha = 0.3f))
+                          )
+                      }
+                  }
+
+                  if (st.atVeryEnd) {
+                      var dismissed by remember(st.ci, st.pg) { mutableStateOf(false) }
+                      if (!dismissed) {
+                          Row(
+                              Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = if (controls) 96.dp else 24.dp)
+                                  .clip(RoundedCornerShape(12.dp)).background(Color(0xEE141418)).padding(start = 16.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Text("You've finished this book", color = Color.White, fontSize = 14.sp)
+                              if (next != null) {
+                                  Spacer(Modifier.width(10.dp))
+                                  Button(onClick = { onOpenNext(next.id) }, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                                      Text("Next: " + (if (next.title.length > 22) next.title.take(21) + "…" else next.title), fontSize = 13.sp)
+                                  }
+                              }
+                              IconButton(onClick = { dismissed = true }) { Icon(Icons.Filled.Close, "Dismiss", tint = Muted) }
+                          }
+                      }
+                  }
+              }
+
+              if (showToc) TocDialog(st) { showToc = false }
+              if (showSettings) EpubSettings(st) { showSettings = false }
           }
 
           @Composable
-          fun EpubReader(info: BookInfo, book: EpubBook, next: NextBook?, onClose: () -> Unit, onOpenNext: (String) -> Unit) {
+          fun TocDialog(st: EpubState, onDismiss: () -> Unit) {
+              val book = st.book
+              val current = book.toc.indexOfLast { it.spine <= st.ci }
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(Modifier.clip(RoundedCornerShape(14.dp)).background(Color(0xFF16161B)).fillMaxWidth().heightIn(max = 560.dp).padding(vertical = 12.dp)) {
+                      Text("Contents", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.padding(16.dp, 4.dp, 16.dp, 8.dp))
+                      if (book.toc.isEmpty()) {
+                          LazyColumn {
+                              itemsIndexed(book.spine) { i, _ ->
+                                  TocRow("Section ${i + 1}", 0, i == st.ci) {
+                                      st.open(i, Target.Start)
+                                      onDismiss()
+                                  }
+                              }
+                          }
+                      } else {
+                          LazyColumn {
+                              itemsIndexed(book.toc) { n, e ->
+                                  TocRow(e.title, e.level, n == current) {
+                                      st.open(e.spine, e.fragment?.let { Target.Anchor(it) } ?: Target.Start)
+                                      onDismiss()
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun TocRow(title: String, level: Int, selected: Boolean, onClick: () -> Unit) {
+              Text(
+                  title,
+                  color = if (selected) Purple else Color.White,
+                  fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                  maxLines = 2,
+                  overflow = TextOverflow.Ellipsis,
+                  modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+                      .padding(start = (16 + level * 16).dp, end = 16.dp, top = 10.dp, bottom = 10.dp)
+              )
+          }
+
+          @Composable
+          private fun ChoiceRow(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+              Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                  options.forEachIndexed { i, label ->
+                      FilterChip(selected = selected == i, onClick = { onSelect(i) }, label = { Text(label, fontSize = 12.sp, maxLines = 1) })
+                  }
+              }
+          }
+
+          @Composable
+          fun EpubSettings(st: EpubState, onDismiss: () -> Unit) {
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(Modifier.clip(RoundedCornerShape(14.dp)).background(Color(0xFF16161B)).padding(16.dp).verticalScroll(rememberScrollState())) {
+                      Text("Theme", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp))
+                      Row(Modifier.padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                          PALETTES.forEachIndexed { i, p ->
+                              Box(
+                                  Modifier.size(48.dp).clip(CircleShape).background(Color(p.bg))
+                                      .border(if (st.theme == i) 3.dp else 1.dp, if (st.theme == i) Purple else Muted, CircleShape)
+                                      .clickable { st.setTheme(i) },
+                                  contentAlignment = Alignment.Center
+                              ) { Text("Aa", color = Color(p.fg), fontWeight = FontWeight.Bold) }
+                          }
+                      }
+                      Text("Text size", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
+                      Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                          OutlinedButton(onClick = { st.setFontSize(st.fontSize - 10) }) { Text("A−", color = Color.White) }
+                          Text("${st.fontSize}%", color = Color.White, modifier = Modifier.width(80.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                          OutlinedButton(onClick = { st.setFontSize(st.fontSize + 10) }) { Text("A+", color = Color.White) }
+                      }
+                      Text("Font", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
+                      ChoiceRow(EPUB_FONTS, st.font) { st.setFont(it) }
+                      Text("Line spacing", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
+                      ChoiceRow(EPUB_LINES, st.line) { st.setLine(it) }
+                      Text("Margins", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
+                      ChoiceRow(EPUB_MARGINS, st.margin) { st.setMargin(it) }
+                      TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) { Text("Done") }
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+      - name: Write EpubState.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/EpubState.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import android.net.Uri
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebView
+          import androidx.compose.runtime.Stable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import org.json.JSONObject
+          import java.io.ByteArrayInputStream
+
+          class Palette(val name: String, val bg: Int, val fg: Int, val link: Int)
+
+          val PALETTES = listOf(
+              Palette("White", 0xFFFFFFFF.toInt(), 0xFF1A1A1A.toInt(), 0xFF1565C0.toInt()),
+              Palette("Sepia", 0xFFF4ECD8.toInt(), 0xFF3B2F1E.toInt(), 0xFF8A4B08.toInt()),
+              Palette("Dark", 0xFF1B1B1F.toInt(), 0xFFD8D8DC.toInt(), 0xFF9FB8FF.toInt()),
+              Palette("Black", 0xFF000000.toInt(), 0xFFBDBDBD.toInt(), 0xFF8AB4F8.toInt())
+          )
+
+          val EPUB_FONTS = listOf("Book's own", "Serif", "Sans-serif", "Monospace")
+          val EPUB_LINES = listOf("Tight", "Normal", "Loose")
+          val EPUB_MARGINS = listOf("Narrow", "Medium", "Wide")
+
+          sealed interface Target {
+              data object Start : Target
+              data object End : Target
+              class Frac(val f: Double) : Target
+              class Anchor(val id: String) : Target
+          }
+
+          private fun hex(c: Int) = String.format("#%06X", c and 0xFFFFFF)
+
+          @Stable
+          class EpubState(val book: EpubBook, val info: BookInfo) {
+              var ci by mutableIntStateOf(0)
+              var pg by mutableIntStateOf(0)
+              var pc by mutableIntStateOf(1)
+              var loading by mutableStateOf(true)
+
+              var theme by mutableIntStateOf(Prefs.epubTheme.coerceIn(0, PALETTES.lastIndex))
+              var fontSize by mutableIntStateOf(Prefs.epubSize)
+              var font by mutableIntStateOf(Prefs.epubFont)
+              var line by mutableIntStateOf(Prefs.epubLine)
+              var margin by mutableIntStateOf(Prefs.epubMargin)
+
+              var web: WebView? = null
+              private var target: Target = Target.Start
+              private var seq = 0
+              private var htmlMode = false
+              private var stickEnd = false
+
+              val palette: Palette get() = PALETTES[theme]
+              val last: Int get() = book.spine.size - 1
+              val atVeryEnd: Boolean get() = ci == last && pg >= pc - 1 && !loading
+
+              val overall: Float
+                  get() = if (atVeryEnd) 1f else book.overall(ci, pg.toDouble() / pc.coerceAtLeast(1))
+
+              private fun cfg(): String {
+                  val family = when (this.font) {
+                      1 -> "Georgia, 'Noto Serif', serif"
+                      2 -> "Roboto, 'Noto Sans', sans-serif"
+                      3 -> "monospace"
+                      else -> ""
+                  }
+                  return JSONObject()
+                      .put("bg", hex(palette.bg)).put("fg", hex(palette.fg)).put("link", hex(palette.link))
+                      .put("padX", when (margin) { 0 -> 14; 2 -> 40; else -> 26 })
+                      .put("padY", 24)
+                      .put("line", when (line) { 0 -> 1.3; 2 -> 1.85; else -> 1.55 })
+                      .put("font", family)
+                      .toString()
+              }
+
+              private fun url(i: Int): String {
+                  val b = Uri.Builder().scheme("https").authority("epub.local").encodedPath("/" + Uri.encode(book.spine[i], "/"))
+                  if (htmlMode) b.appendQueryParameter("h", "1")
+                  return b.build().toString()
+              }
+
+              fun start() {
+                  val startFinished = Books.percent(info.id) >= 0.985f
+                  val i = if (startFinished) 0 else info.startA.coerceIn(0, last)
+                  open(i, if (startFinished || (i == 0 && info.startB <= 0.0)) Target.Start else Target.Frac(info.startB))
+              }
+
+              fun open(i: Int, t: Target) {
+                  ci = i.coerceIn(0, last)
+                  target = t
+                  stickEnd = t is Target.End
+                  loading = true
+                  htmlMode = false
+                  seq++
+                  web?.loadUrl(url(ci))
+              }
+
+              fun next() {
+                  stickEnd = false
+                  if (pg < pc - 1) {
+                      pg++
+                      go()
+                  } else if (ci < last) open(ci + 1, Target.Start)
+              }
+
+              fun prev() {
+                  stickEnd = false
+                  if (pg > 0) {
+                      pg--
+                      go()
+                  } else if (ci > 0) open(ci - 1, Target.End)
+              }
+
+              private fun go() {
+                  web?.evaluateJavascript("fx.go($pg)", null)
+              }
+
+              fun seekOverall(v: Float) {
+                  val (i, f) = book.locate(v)
+                  if (i == ci && !loading) {
+                      pg = (f * pc).toInt().coerceIn(0, pc - 1)
+                      go()
+                  } else open(i, Target.Frac(f))
+              }
+
+              /** Called when a chapter has finished loading: lay it out in pages and go to the wanted spot. */
+              fun onLoaded(v: WebView) {
+                  val mySeq = seq
+                  v.evaluateJavascript("document.getElementsByTagName('parsererror').length") { r ->
+                      if (mySeq != seq) return@evaluateJavascript
+                      if ((r?.trim('"')?.toIntOrNull() ?: 0) > 0 && !htmlMode) {
+                          // Chapter isn't clean XHTML: read it leniently as HTML instead.
+                          htmlMode = true
+                          v.loadUrl(url(ci))
+                          return@evaluateJavascript
+                      }
+                      v.evaluateJavascript(EpubJs.LIB, null)
+                      v.evaluateJavascript("fx.apply(${cfg()})") { r2 ->
+                          if (mySeq != seq) return@evaluateJavascript
+                          val n = r2?.trim('"')?.toIntOrNull() ?: 1
+                          pc = n.coerceAtLeast(1)
+                          when (val t = target) {
+                              Target.Start -> place(0, mySeq)
+                              Target.End -> place(pc - 1, mySeq)
+                              is Target.Frac -> place((t.f * pc).toInt(), mySeq)
+                              is Target.Anchor -> v.evaluateJavascript("fx.anchor(${JSONObject.quote(t.id)})") { r3 ->
+                                  place(r3?.trim('"')?.toIntOrNull() ?: 0, mySeq)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun place(p: Int, mySeq: Int) {
+                  if (mySeq != seq) return
+                  pg = p.coerceIn(0, pc - 1)
+                  go()
+                  loading = false
+                  // Pictures and fonts can arrive late and change the page count, so check again shortly after.
+                  web?.postDelayed({ remeasure(mySeq) }, 600)
+                  web?.postDelayed({ remeasure(mySeq) }, 1800)
+              }
+
+              private fun remeasure(mySeq: Int) {
+                  val v = web ?: return
+                  v.evaluateJavascript("fx.measure()") { r ->
+                      if (mySeq != seq) return@evaluateJavascript
+                      val n = r?.trim('"')?.toIntOrNull() ?: return@evaluateJavascript
+                      if (n != pc) {
+                          val frac = pg.toDouble() / pc
+                          pc = n
+                          pg = if (stickEnd) n - 1 else (frac * n).toInt().coerceIn(0, n - 1)
+                          go()
+                      }
+                  }
+              }
+
+              /** Re-flow the current chapter after a setting (or the window size) changed, staying at the same place. */
+              fun reapply() {
+                  val v = web ?: return
+                  if (loading) return
+                  val s = seq
+                  val frac = pg.toDouble() / pc.coerceAtLeast(1)
+                  v.settings.textZoom = fontSize
+                  v.setBackgroundColor(palette.bg)
+                  v.postDelayed({
+                      v.evaluateJavascript("fx.apply(${cfg()})") { r ->
+                          if (s != seq) return@evaluateJavascript
+                          val n = r?.trim('"')?.toIntOrNull() ?: 1
+                          pc = n.coerceAtLeast(1)
+                          pg = (frac * pc).toInt().coerceIn(0, pc - 1)
+                          go()
+                      }
+                  }, 150)
+              }
+
+              fun setTheme(v: Int) { theme = v; Prefs.epubTheme = v; reapply() }
+              fun setFontSize(v: Int) { fontSize = v.coerceIn(70, 220); Prefs.epubSize = fontSize; reapply() }
+              fun setFont(v: Int) { font = v; Prefs.epubFont = v; reapply() }
+              fun setLine(v: Int) { line = v; Prefs.epubLine = v; reapply() }
+              fun setMargin(v: Int) { margin = v; Prefs.epubMargin = v; reapply() }
+
+              fun serve(req: WebResourceRequest): WebResourceResponse {
+                  val u = req.url
+                  if (u.host != "epub.local") return blank(403)
+                  val path = Uri.decode(u.encodedPath ?: "").trimStart('/')
+                  val stream = book.open(path) ?: return blank(404)
+                  var mime = book.mimeOf(path)
+                  if (mime == "application/xhtml+xml" && u.getQueryParameter("h") == "1") mime = "text/html"
+                  val enc = if (mime.startsWith("text/") || mime.contains("xml") || mime.contains("javascript")) "utf-8" else null
+                  return WebResourceResponse(mime, enc, stream)
+              }
+
+              private fun blank(code: Int) = WebResourceResponse(
+                  "text/plain", "utf-8", code, if (code == 404) "Not Found" else "Forbidden", emptyMap(), ByteArrayInputStream(ByteArray(0))
+              )
           }
           FEYNOS_EOF
 
