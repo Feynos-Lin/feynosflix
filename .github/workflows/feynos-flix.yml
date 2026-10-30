@@ -2248,23 +2248,23 @@ jobs:
                               Box(
                                   Modifier.size(48.dp).clip(CircleShape).background(Color(p.bg))
                                       .border(if (st.theme == i) 3.dp else 1.dp, if (st.theme == i) Purple else Muted, CircleShape)
-                                      .clickable { st.setTheme(i) },
+                                      .clickable { st.chooseTheme(i) },
                                   contentAlignment = Alignment.Center
                               ) { Text("Aa", color = Color(p.fg), fontWeight = FontWeight.Bold) }
                           }
                       }
                       Text("Text size", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
                       Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                          OutlinedButton(onClick = { st.setFontSize(st.fontSize - 10) }) { Text("A−", color = Color.White) }
+                          OutlinedButton(onClick = { st.chooseFontSize(st.fontSize - 10) }) { Text("A−", color = Color.White) }
                           Text("${st.fontSize}%", color = Color.White, modifier = Modifier.width(80.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                          OutlinedButton(onClick = { st.setFontSize(st.fontSize + 10) }) { Text("A+", color = Color.White) }
+                          OutlinedButton(onClick = { st.chooseFontSize(st.fontSize + 10) }) { Text("A+", color = Color.White) }
                       }
                       Text("Font", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
-                      ChoiceRow(EPUB_FONTS, st.font) { st.setFont(it) }
+                      ChoiceRow(EPUB_FONTS, st.font) { st.chooseFont(it) }
                       Text("Line spacing", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
-                      ChoiceRow(EPUB_LINES, st.line) { st.setLine(it) }
+                      ChoiceRow(EPUB_LINES, st.line) { st.chooseLine(it) }
                       Text("Margins", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(8.dp, 16.dp, 8.dp, 4.dp))
-                      ChoiceRow(EPUB_MARGINS, st.margin) { st.setMargin(it) }
+                      ChoiceRow(EPUB_MARGINS, st.margin) { st.chooseMargin(it) }
                       TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) { Text("Done") }
                   }
               }
@@ -2475,11 +2475,11 @@ jobs:
                   }, 150)
               }
 
-              fun setTheme(v: Int) { theme = v; Prefs.epubTheme = v; reapply() }
-              fun setFontSize(v: Int) { fontSize = v.coerceIn(70, 220); Prefs.epubSize = fontSize; reapply() }
-              fun setFont(v: Int) { font = v; Prefs.epubFont = v; reapply() }
-              fun setLine(v: Int) { line = v; Prefs.epubLine = v; reapply() }
-              fun setMargin(v: Int) { margin = v; Prefs.epubMargin = v; reapply() }
+              fun chooseTheme(v: Int) { theme = v; Prefs.epubTheme = v; reapply() }
+              fun chooseFontSize(v: Int) { fontSize = v.coerceIn(70, 220); Prefs.epubSize = fontSize; reapply() }
+              fun chooseFont(v: Int) { font = v; Prefs.epubFont = v; reapply() }
+              fun chooseLine(v: Int) { line = v; Prefs.epubLine = v; reapply() }
+              fun chooseMargin(v: Int) { margin = v; Prefs.epubMargin = v; reapply() }
 
               fun serve(req: WebResourceRequest): WebResourceResponse {
                   val u = req.url
