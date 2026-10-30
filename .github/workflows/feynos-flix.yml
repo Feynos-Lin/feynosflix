@@ -829,8 +829,11 @@ jobs:
                       onPage(if (sp < spreads.size) spreads[sp][0] else loader.count)
                   }
               }
+              val seenJump = remember { jump?.token }
               LaunchedEffect(jump) {
-                  jump?.let { j -> state.scrollToPage(spreads.indexOfFirst { j.page in it }.coerceAtLeast(0)) }
+                  jump?.let { j ->
+                      if (j.token != seenJump) state.scrollToPage(spreads.indexOfFirst { j.page in it }.coerceAtLeast(0))
+                  }
               }
 
               BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
@@ -905,8 +908,9 @@ jobs:
               LaunchedEffect(list) {
                   snapshotFlow { list.firstVisibleItemIndex }.distinctUntilChanged().collect { onPage(it.coerceAtMost(loader.count)) }
               }
+              val seenJump = remember { jump?.token }
               LaunchedEffect(jump) {
-                  jump?.let { list.scrollToItem(it.page.coerceIn(0, loader.count)) }
+                  jump?.let { if (it.token != seenJump) list.scrollToItem(it.page.coerceIn(0, loader.count)) }
               }
 
               BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
@@ -1939,10 +1943,18 @@ jobs:
                 return this.measure();
               },
               measure: function () {
-                var W = window.innerWidth, r = document.documentElement, b = document.body;
+                var W = window.innerWidth, d = document, r = d.documentElement, b = d.body;
+                var pad = d.getElementById('fx-pad');
+                if (!pad) {
+                  pad = d.createElement('div'); pad.id = 'fx-pad';
+                  pad.setAttribute('style', 'position:absolute;top:0;width:1px;height:1px;visibility:hidden;');
+                  r.appendChild(pad);
+                }
+                pad.style.left = '0px';
                 var sw = Math.max(r.scrollWidth, b ? b.scrollWidth : 0);
                 this.W = W;
                 this.n = Math.max(1, Math.round((sw + this.px) / W));
+                pad.style.left = (this.n * W - 1) + 'px';
                 return this.n;
               },
               go: function (p) { window.scrollTo(Math.max(0, p) * (this.W || window.innerWidth), 0); return p; },
@@ -2408,6 +2420,11 @@ jobs:
 
               /** Called when a chapter has finished loading: lay it out in pages and go to the wanted spot. */
               fun onLoaded(v: WebView) {
+                  if (v.width == 0 || v.height == 0) {
+                      // Not laid out on screen yet; measuring now would give nonsense page counts.
+                      v.postDelayed({ onLoaded(v) }, 100)
+                      return
+                  }
                   val mySeq = seq
                   v.evaluateJavascript("document.getElementsByTagName('parsererror').length") { r ->
                       if (mySeq != seq) return@evaluateJavascript
