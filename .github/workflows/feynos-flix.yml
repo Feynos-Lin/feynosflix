@@ -1522,9 +1522,11 @@ jobs:
 
               suspend fun start(item: Item) {
                   if (get(item.id) != null) return
-                  val full = if (item.j.has("MediaSources")) item else Jf.item(item.id)
-                  val container = full.j.optJSONArray("MediaSources").objs().firstOrNull()?.s("Container")
-                      ?.substringBefore(',')?.ifBlank { null } ?: "mkv"
+                  val container = if (item.isBook) "book" else {
+                      val full = if (item.j.has("MediaSources")) item else Jf.item(item.id)
+                      full.j.optJSONArray("MediaSources").objs().firstOrNull()?.s("Container")
+                          ?.substringBefore(',')?.ifBlank { null } ?: "mkv"
+                  }
                   val fileName = "${item.id}.$container"
                   val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: throw IOException("Storage not available")
                   val req = DownloadManager.Request(Uri.parse(Jf.downloadUrl(item.id)))
@@ -2619,7 +2621,7 @@ jobs:
               var failed = 0
 
               fun ordered(): List<RowData> {
-                  val keys = listOf("continue", "next", "fav") + latestKeys.take(1) + listOf("top") + latestKeys.drop(1) + genreKeys
+                  val keys = listOf("continue", "reading", "next", "fav") + latestKeys.take(1) + listOf("top") + latestKeys.drop(1) + genreKeys
                   return keys.mapNotNull { rows[it] }.filter { it.items.isNotEmpty() }
               }
 
@@ -2650,14 +2652,26 @@ jobs:
                       launch {
                           hero = safe {
                               Jf.query(
-                                  mapOf("IncludeItemTypes" to types, "SortBy" to "Random", "Limit" to 1, "ImageTypes" to "Backdrop", "Fields" to "Genres"),
+                                  mapOf("IncludeItemTypes" to types, "SortBy" to "Random", "Limit" to 1, "ImageTypes" to (if (filter == "Book") "Primary" else "Backdrop"), "Fields" to "Genres"),
                                   count = false
                               ).first.firstOrNull()
                           }
                           publish()
                       }
                   }
-                  row("continue", "Continue Watching", RowStyle.Wide) {
+                  if (filter == null || filter == "Book") {
+                      row("reading", "Continue Reading", RowStyle.Poster) {
+                          val ids = Books.recent(20)
+                          if (ids.isEmpty()) emptyList() else {
+                              val found = Jf.query(
+                                  mapOf("Ids" to ids.joinToString(","), "Fields" to Jf.CARD, "Limit" to ids.size),
+                                  count = false
+                              ).first.associateBy { it.id }
+                              ids.mapNotNull { found[it] }
+                          }
+                      }
+                  }
+                  if (filter != "Book") row("continue", "Continue Watching", RowStyle.Wide) {
                       Jf.resume().filter {
                           when (filter) {
                               "Movie" -> it.type == "Movie"
@@ -2666,11 +2680,11 @@ jobs:
                           }
                       }
                   }
-                  if (filter != "Movie") row("next", "Next Up", RowStyle.Wide) { Jf.nextUp(null, 20, false) }
+                  if (filter == null || filter == "Series") row("next", "Next Up", RowStyle.Wide) { Jf.nextUp(null, 20, false) }
                   row("fav", "My List", RowStyle.Poster, browseRoute("My List", "fav", "_", "Movie,Series,Episode")) {
                       Jf.query(card + mapOf("IncludeItemTypes" to types, "Filters" to "IsFavorite", "SortBy" to "DateCreated", "SortOrder" to "Descending", "Limit" to 30), count = false).first
                   }
-                  row("top", "Top 10 on Your Server", RowStyle.Top10) {
+                  if (filter != "Book") row("top", "Top 10 on Your Server", RowStyle.Top10) {
                       Jf.query(card + mapOf("IncludeItemTypes" to types, "SortBy" to "CommunityRating,SortName", "SortOrder" to "Descending", "Limit" to 10), count = false).first
                   }
                   launch {
@@ -2678,7 +2692,8 @@ jobs:
                           when (filter) {
                               "Movie" -> v.collectionType == "movies"
                               "Series" -> v.collectionType == "tvshows"
-                              else -> v.collectionType in setOf("movies", "tvshows", "homevideos", "mixed", null)
+                              "Book" -> v.collectionType == "books"
+                              else -> v.collectionType in setOf("movies", "tvshows", "homevideos", "mixed", "books", null)
                           }
                       }
                       latestKeys = views.map { "latest:${it.id}" }
@@ -3060,7 +3075,7 @@ jobs:
                       .map { it.name }.filter { it.isNotBlank() }
 
               suspend fun search(term: String): List<Item> =
-                  query(mapOf("SearchTerm" to term, "IncludeItemTypes" to "Movie,Series,Episode,BoxSet", "Limit" to 60)).first
+                  query(mapOf("SearchTerm" to term, "IncludeItemTypes" to "Movie,Series,Episode,BoxSet,Book", "Limit" to 60)).first
 
               suspend fun segments(id: String): List<Segment> {
                   val list = mutableListOf<Segment>()
@@ -4993,11 +5008,10 @@ jobs:
                       if (filter != null) {
                           FilterChip(selected = true, onClick = { onFilter(null) }, label = { Icon(Icons.Filled.Close, "Clear", Modifier.size(16.dp)) }, colors = chipColors)
                       }
-                      if (filter != "Movie") {
-                          FilterChip(selected = filter == "Series", onClick = { onFilter(if (filter == "Series") null else "Series") }, label = { Text("Shows") }, colors = chipColors)
-                      }
-                      if (filter != "Series") {
-                          FilterChip(selected = filter == "Movie", onClick = { onFilter(if (filter == "Movie") null else "Movie") }, label = { Text("Movies") }, colors = chipColors)
+                      listOf("Series" to "Shows", "Movie" to "Movies", "Book" to "Books").forEach { (kind, label) ->
+                          if (filter == null || filter == kind) {
+                              FilterChip(selected = filter == kind, onClick = { onFilter(if (filter == kind) null else kind) }, label = { Text(label) }, colors = chipColors)
+                          }
                       }
                       FilterChip(
                           selected = false, onClick = onCats, label = { Text("Categories") },
@@ -5054,9 +5068,9 @@ jobs:
                               colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
                               contentPadding = PaddingValues(horizontal = 28.dp, vertical = 10.dp)
                           ) {
-                              Icon(Icons.Filled.PlayArrow, null)
+                              Icon(if (item.isBook) Icons.Filled.MenuBook else Icons.Filled.PlayArrow, null)
                               Spacer(Modifier.width(4.dp))
-                              Text("Play", fontWeight = FontWeight.Bold)
+                              Text(if (item.isBook) "Read" else "Play", fontWeight = FontWeight.Bold)
                           }
                           IconLabel(Icons.Filled.Info, "Info") { nav.navigate("detail/${item.id}") }
                       }
@@ -5170,18 +5184,36 @@ jobs:
                           val target: Item? = if (isSeries) nextUp else item
                           val resumeMs = (target?.positionTicks ?: 0L) / 10_000
                           Button(
-                              onClick = { if (isSeries) playSmart(ctx, scope, item, nav) else play(ctx, item.id) },
+                              onClick = {
+                                  when {
+                                      item.isBook -> openBook(ctx, item.id)
+                                      isSeries -> playSmart(ctx, scope, item, nav)
+                                      else -> play(ctx, item.id)
+                                  }
+                              },
                               modifier = Modifier.fillMaxWidth().height(46.dp),
                               shape = RoundedCornerShape(6.dp),
                               colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
                           ) {
-                              Icon(Icons.Filled.PlayArrow, null)
+                              Icon(if (item.isBook) Icons.Filled.MenuBook else Icons.Filled.PlayArrow, null)
                               Spacer(Modifier.width(6.dp))
-                              val label = buildString {
+                              val bookPct = if (item.isBook) Books.percent(item.id) else 0f
+                              val label = if (item.isBook) {
+                                  if (bookPct in 0.005f..0.985f) "Continue reading" else "Read"
+                              } else buildString {
                                   append(if (resumeMs > 0) "Resume" else "Play")
                                   if (isSeries && target != null) target.episodeLabel?.let { append(" ").append(it) }
                               }
                               Text(label, fontWeight = FontWeight.Bold)
+                          }
+                          if (item.isBook) {
+                              val pct = Books.percent(item.id)
+                              if (pct in 0.005f..0.985f) {
+                                  Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                      ProgressLine(pct, Modifier.weight(1f))
+                                      Text("  ${(pct * 100).toInt()}% read", fontSize = 12.sp, color = Muted)
+                                  }
+                              }
                           }
                           if (resumeMs > 0 && target != null) {
                               Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -5194,7 +5226,7 @@ jobs:
                                   Text("Start from beginning", color = Color.White)
                               }
                           }
-                          if (item.isPlayable) {
+                          if (item.isPlayable || item.isBook) {
                               Spacer(Modifier.height(8.dp))
                               DownloadButton(item)
                           }
@@ -5219,7 +5251,7 @@ jobs:
                                           .onFailure { toast(ctx, "Couldn't update My List") }
                                   }
                               }
-                              IconLabel(if (watched) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked, if (watched) "Watched" else "Mark watched") {
+                              IconLabel(if (watched) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked, if (watched) (if (item.isBook) "Read" else "Watched") else (if (item.isBook) "Mark read" else "Mark watched")) {
                                   scope.launch {
                                       runCatching { Jf.setPlayed(item.id, !watched) }
                                           .onSuccess { watched = !watched; Session.tick++ }
@@ -5397,7 +5429,7 @@ jobs:
           fun PersonRow(p: Person) {
               val nav = LocalNav.current
               Row(
-                  Modifier.fillMaxWidth().clickable { nav.navigate(browseRoute(p.name, "person", p.id, "Movie,Series")) }
+                  Modifier.fillMaxWidth().clickable { nav.navigate(browseRoute(p.name, "person", p.id, "Movie,Series,Book")) }
                       .padding(horizontal = 16.dp, vertical = 8.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
@@ -5702,7 +5734,7 @@ jobs:
                       ) {
                           Icon(Icons.Filled.Download, null, tint = Muted, modifier = Modifier.size(88.dp).background(Surf, CircleShape).padding(20.dp))
                           Spacer(Modifier.height(16.dp))
-                          Text("Movies and episodes you download appear here, ready to watch without a connection.", color = Muted, textAlign = TextAlign.Center)
+                          Text("Movies, episodes, comics and books you download appear here, ready without a connection.", color = Muted, textAlign = TextAlign.Center)
                       }
                   } else {
                       LazyColumn(Modifier.fillMaxSize()) {
@@ -5722,7 +5754,7 @@ jobs:
               val failed = st.state == DownloadManager.STATUS_FAILED
               var confirm by remember { mutableStateOf(false) }
               Row(
-                  Modifier.fillMaxWidth().clickable(enabled = done) { playOffline(ctx, e.id) }.padding(horizontal = 16.dp, vertical = 8.dp),
+                  Modifier.fillMaxWidth().clickable(enabled = done) { if (e.type == "Book") openBookOffline(ctx, e.id) else playOffline(ctx, e.id) }.padding(horizontal = 16.dp, vertical = 8.dp),
                   verticalAlignment = Alignment.CenterVertically
               ) {
                   Box(Modifier.width(64.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(6.dp)).background(Surf)) {
@@ -5806,6 +5838,7 @@ jobs:
                                   when (v.collectionType) {
                                       "movies" -> Icons.Filled.Movie
                                       "tvshows" -> Icons.Filled.Tv
+                                      "books" -> Icons.Filled.MenuBook
                                       else -> Icons.Filled.VideoLibrary
                                   }, null
                               )
@@ -5935,6 +5968,15 @@ jobs:
                       )
                       Text("App", color = Purple, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp, 20.dp, 16.dp, 4.dp))
                       SwitchRow("Check for updates on launch", "Looks for new releases on GitHub", upd) { upd = it; Prefs.checkUpdates = it }
+                      ListItem(
+                          headlineContent = { Text("Clear book cache") },
+                          supportingContent = { Text("Removes comics and books kept for reading; downloads are not touched") },
+                          colors = rowColors,
+                          modifier = Modifier.clickable {
+                              Books.clearCache()
+                              toast(ctx, "Book cache cleared")
+                          }
+                      )
                       ListItem(
                           headlineContent = { Text("Clear image cache") },
                           supportingContent = { Text("Frees space; artwork re-downloads as you browse") },
@@ -6132,11 +6174,20 @@ jobs:
               "boxsets" -> "BoxSet"
               "homevideos" -> "Video"
               "musicvideos" -> "MusicVideo"
+              "books" -> "Book"
               else -> null
           }
 
           fun play(ctx: Context, id: String, startMs: Long = -1L) {
               ctx.startActivity(Intent(ctx, PlayerActivity::class.java).putExtra("id", id).putExtra("startMs", startMs))
+          }
+
+          fun openBook(ctx: Context, id: String) {
+              ctx.startActivity(Intent(ctx, ReaderActivity::class.java).putExtra("id", id))
+          }
+
+          fun openBookOffline(ctx: Context, id: String) {
+              ctx.startActivity(Intent(ctx, ReaderActivity::class.java).putExtra("offline", id))
           }
 
           fun playOffline(ctx: Context, id: String) {
@@ -6154,6 +6205,7 @@ jobs:
           /** Play a movie/episode directly; for a series, play what's next (or episode 1). */
           fun playSmart(ctx: Context, scope: CoroutineScope, item: Item, nav: NavHostController) {
               when {
+                  item.isBook -> openBook(ctx, item.id)
                   item.isPlayable -> play(ctx, item.id)
                   item.type == "Series" -> scope.launch {
                       val ep = runCatching { Jf.nextUp(item.id, 1, true).firstOrNull() ?: Jf.firstEpisode(item.id) }.getOrNull()
@@ -6202,7 +6254,8 @@ jobs:
                           fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.Bold
                       )
                   }
-                  if (item.progress > 0f && !item.played) ProgressLine(item.progress, Modifier.align(Alignment.BottomCenter))
+                  val shownProgress = if (item.isBook) Books.percent(item.id).takeIf { it < 0.985f } ?: 0f else item.progress
+                  if (shownProgress > 0f && !item.played) ProgressLine(shownProgress, Modifier.align(Alignment.BottomCenter))
               }
           }
 
