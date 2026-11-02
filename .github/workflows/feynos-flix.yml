@@ -174,7 +174,7 @@ jobs:
                   <activity
                       android:name=".PlayerActivity"
                       android:exported="false"
-                      android:screenOrientation="sensorLandscape"
+                      android:screenOrientation="fullUser"
                       android:supportsPictureInPicture="true"
                       android:resizeableActivity="true"
                       android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode" />
@@ -3771,6 +3771,8 @@ jobs:
           import android.app.Activity
           import android.app.PictureInPictureParams
           import android.content.Context
+          import android.content.pm.ActivityInfo
+          import android.content.res.Configuration
           import android.graphics.Bitmap
           import android.graphics.drawable.BitmapDrawable
           import android.media.AudioManager
@@ -3788,6 +3790,7 @@ jobs:
           import androidx.compose.foundation.BorderStroke
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
           import androidx.compose.foundation.border
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.gestures.detectVerticalDragGestures
@@ -3807,6 +3810,7 @@ jobs:
           import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.input.pointer.pointerInput
           import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalConfiguration
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.style.TextAlign
@@ -4366,11 +4370,22 @@ jobs:
           // ======================= Player UI =======================
 
           @Composable
-          fun PlayerAction(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
-              TextButton(onClick = onClick) {
-                  Icon(icon, null, tint = Color.White, modifier = Modifier.size(20.dp))
-                  Spacer(Modifier.width(6.dp))
-                  Text(label, color = Color.White, fontSize = 13.sp)
+          fun PlayerAction(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, compact: Boolean, onClick: () -> Unit) {
+              if (compact) {
+                  // Narrow (portrait) screens: icon above a short label so four actions fit in a row.
+                  Column(
+                      Modifier.clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 4.dp),
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Icon(icon, null, tint = Color.White, modifier = Modifier.size(24.dp))
+                      Text(label, color = Color.White, fontSize = 11.sp, maxLines = 1)
+                  }
+              } else {
+                  TextButton(onClick = onClick) {
+                      Icon(icon, null, tint = Color.White, modifier = Modifier.size(20.dp))
+                      Spacer(Modifier.width(6.dp))
+                      Text(label, color = Color.White, fontSize = 13.sp)
+                  }
               }
           }
 
@@ -4507,6 +4522,13 @@ jobs:
                                   resize = if (fit) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
                                   poke++
                               }) { Icon(if (fit) Icons.Filled.Fullscreen else Icons.Filled.FullscreenExit, "Fill screen", tint = Color.White) }
+                              IconButton(onClick = {
+                                  // Override the phone's rotation: flip between portrait and landscape.
+                                  val portrait = act.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+                                  act.requestedOrientation = if (portrait) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                                  else ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                                  poke++
+                              }) { Icon(Icons.Filled.ScreenRotation, "Rotate screen", tint = Color.White) }
                               IconButton(onClick = onPip) { Icon(Icons.Filled.PictureInPictureAlt, "Picture in picture", tint = Color.White) }
                           }
 
@@ -4570,10 +4592,11 @@ jobs:
                                   Text(clock(c.duration - c.position), color = Color.White, fontSize = 13.sp)
                               }
                               Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                                  PlayerAction(Icons.Filled.Speed, "Speed (${c.speed}x)") { panel = "speed" }
-                                  PlayerAction(Icons.Filled.Subtitles, "Audio & Subtitles") { panel = "tracks" }
-                                  if (c.offline == null) PlayerAction(Icons.Filled.HighQuality, "Quality") { panel = "quality" }
-                                  if (c.next != null) PlayerAction(Icons.Filled.SkipNext, "Next Episode") { c.playNext() }
+                                  val narrow = LocalConfiguration.current.screenWidthDp < 600
+                                  PlayerAction(Icons.Filled.Speed, if (narrow) "${c.speed}x" else "Speed (${c.speed}x)", narrow) { panel = "speed" }
+                                  PlayerAction(Icons.Filled.Subtitles, if (narrow) "Audio/Subs" else "Audio & Subtitles", narrow) { panel = "tracks" }
+                                  if (c.offline == null) PlayerAction(Icons.Filled.HighQuality, "Quality", narrow) { panel = "quality" }
+                                  if (c.next != null) PlayerAction(Icons.Filled.SkipNext, if (narrow) "Next" else "Next Episode", narrow) { c.playNext() }
                               }
                           }
                       }
@@ -4715,13 +4738,13 @@ jobs:
                   Box(Modifier.width(130.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(6.dp)).background(Surf)) {
                       AsyncImage(model = Jf.thumb(n, 400), contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                   }
-                  Column(Modifier.padding(start = 10.dp)) {
+                  Column(Modifier.padding(start = 10.dp).weight(1f)) {
                       Text("Next Episode", color = Muted, fontSize = 12.sp)
                       Text(
                           listOfNotNull(n.episodeLabel, n.name).joinToString("  "), color = Color.White,
                           maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold
                       )
-                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                      FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.Center) {
                           Button(
                               onClick = { c.playNext() },
                               colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
