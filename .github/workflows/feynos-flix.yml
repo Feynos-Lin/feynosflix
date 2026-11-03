@@ -270,6 +270,1054 @@ jobs:
           include(":app")
           FEYNOS_EOF
 
+      - name: Write Admin.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/Admin.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /** Jellyfin's administrator endpoints. Only an account that is an administrator on the server can use these. */
+          object Adm {
+              suspend fun isAdmin(): Boolean =
+                  Jf.get("/Users/${Jf.uid}").optJSONObject("Policy")?.optBoolean("IsAdministrator") ?: false
+
+              // ---------- overview ----------
+
+              suspend fun systemInfo(): JSONObject = Jf.get("/System/Info")
+
+              suspend fun counts(): JSONObject = Jf.get("/Items/Counts", mapOf("userId" to Jf.uid))
+
+              suspend fun sessions(): List<JSONObject> = Jf.getArr("/Sessions", mapOf("ActiveWithinSeconds" to 960)).objs()
+
+              suspend fun stopSession(id: String) {
+                  Jf.post("/Sessions/$id/Playing/Stop")
+              }
+
+              suspend fun pauseSession(id: String, pause: Boolean) {
+                  Jf.post("/Sessions/$id/Playing/" + if (pause) "Pause" else "Unpause")
+              }
+
+              suspend fun message(id: String, header: String, text: String) {
+                  Jf.post("/Sessions/$id/Message", body = JSONObject().put("Header", header).put("Text", text).put("TimeoutMs", 15000))
+              }
+
+              // ---------- users ----------
+
+              suspend fun users(): List<JSONObject> = Jf.getArr("/Users").objs()
+
+              suspend fun user(id: String): JSONObject = Jf.get("/Users/$id")
+
+              suspend fun createUser(name: String, password: String) {
+                  Jf.post("/Users/New", body = JSONObject().put("Name", name).put("Password", password))
+              }
+
+              suspend fun setPassword(id: String, password: String) {
+                  Jf.post("/Users/$id/Password", body = JSONObject().put("NewPw", password))
+              }
+
+              suspend fun clearPassword(id: String) {
+                  Jf.post("/Users/$id/Password", body = JSONObject().put("ResetPassword", true))
+              }
+
+              /** Changes one switch in a user's policy. The server wants the whole policy back, so it's fetched fresh first. */
+              suspend fun setPolicyFlag(id: String, key: String, value: Boolean) {
+                  val policy = user(id).optJSONObject("Policy") ?: throw java.io.IOException("Couldn't read this user's permissions")
+                  policy.put(key, value)
+                  Jf.post("/Users/$id/Policy", body = policy)
+              }
+
+              suspend fun deleteUser(id: String) {
+                  Jf.delete("/Users/$id")
+              }
+
+              // ---------- libraries ----------
+
+              suspend fun libraries(): List<JSONObject> = Jf.getArr("/Library/VirtualFolders").objs()
+
+              suspend fun scanAll() {
+                  Jf.post("/Library/Refresh")
+              }
+
+              suspend fun refreshLibrary(itemId: String) {
+                  Jf.post(
+                      "/Items/$itemId/Refresh",
+                      mapOf("Recursive" to true, "ImageRefreshMode" to "Default", "MetadataRefreshMode" to "Default", "ReplaceAllImages" to false, "ReplaceAllMetadata" to false)
+                  )
+              }
+
+              // ---------- scheduled tasks ----------
+
+              suspend fun tasks(): List<JSONObject> = Jf.getArr("/ScheduledTasks", mapOf("IsHidden" to false)).objs()
+
+              suspend fun runTask(id: String) {
+                  Jf.post("/ScheduledTasks/Running/$id")
+              }
+
+              suspend fun stopTask(id: String) {
+                  Jf.delete("/ScheduledTasks/Running/$id")
+              }
+
+              // ---------- activity, devices, keys ----------
+
+              suspend fun activity(limit: Int = 60): List<JSONObject> =
+                  Jf.get("/System/ActivityLog/Entries", mapOf("limit" to limit)).optJSONArray("Items").objs()
+
+              suspend fun devices(): List<JSONObject> = Jf.get("/Devices").optJSONArray("Items").objs()
+
+              suspend fun deleteDevice(id: String) {
+                  Jf.delete("/Devices", mapOf("id" to id))
+              }
+
+              suspend fun keys(): List<JSONObject> = Jf.get("/Auth/Keys").optJSONArray("Items").objs()
+
+              suspend fun createKey(app: String) {
+                  Jf.post("/Auth/Keys", mapOf("app" to app))
+              }
+
+              suspend fun deleteKey(key: String) {
+                  Jf.delete("/Auth/Keys/$key")
+              }
+
+              // ---------- server ----------
+
+              suspend fun restart() {
+                  Jf.post("/System/Restart")
+              }
+
+              suspend fun shutdown() {
+                  Jf.post("/System/Shutdown")
+              }
+
+              suspend fun logFiles(): List<JSONObject> = Jf.getArr("/System/Logs").objs()
+
+              /** The end of a log file (logs can be many megabytes, so only the last [lines] lines are kept). */
+              suspend fun logTail(name: String, lines: Int = 400): String {
+                  val text = Jf.raw("GET", Jf.url("/System/Logs/Log", mapOf("name" to name)))
+                  val all = text.lines()
+                  return all.takeLast(lines).joinToString("\n")
+              }
+          }
+
+          /** "5 minutes ago", "2 hours ago", … for an ISO timestamp from the server. */
+          fun ago(iso: String?): String {
+              val t = Books.parseDate(iso)
+              if (t == 0L) return ""
+              val s = ((System.currentTimeMillis() - t) / 1000).coerceAtLeast(0)
+              return when {
+                  s < 45 -> "just now"
+                  s < 90 -> "a minute ago"
+                  s < 3600 -> "${s / 60} minutes ago"
+                  s < 5400 -> "an hour ago"
+                  s < 86400 -> "${s / 3600} hours ago"
+                  s < 172800 -> "yesterday"
+                  s < 86400L * 30 -> "${s / 86400} days ago"
+                  else -> "${s / (86400L * 30)} months ago"
+              }
+          }
+
+          fun JSONArray?.firstString(): String? = this?.let { if (it.length() > 0) it.optString(0) else null }
+          FEYNOS_EOF
+
+      - name: Write AdminHome.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/AdminHome.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.launch
+          import org.json.JSONObject
+
+          private fun mbps(bits: Long): String = if (bits >= 1_000_000) String.format("%.1f Mbps", bits / 1_000_000.0) else "${bits / 1000} kbps"
+
+          @Composable
+          fun AdminHome() {
+              val nav = LocalNav.current
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var bump by remember { mutableIntStateOf(0) }
+              val infoR by rememberLoad(bump, cacheKey = "admin:info") { Adm.systemInfo() }
+              val countsR by rememberLoad(bump, cacheKey = "admin:counts") { Adm.counts() }
+              val usersR by rememberLoad(bump, cacheKey = "admin:users") { Adm.users() }
+              val sessR by rememberPoll(5000, bump) { Adm.sessions() }
+              var confirmRestart by remember { mutableStateOf(false) }
+
+              val sessions = sessR.orNull() ?: emptyList()
+              val playing = sessions.filter { it.optJSONObject("NowPlayingItem") != null }
+              val transcoding = playing.count { it.optJSONObject("PlayState")?.optString("PlayMethod") == "Transcode" }
+
+              AdminScaffold("Admin dashboard", actions = {
+                  IconButton(onClick = { bump++ }) { Icon(Icons.Filled.Refresh, "Refresh") }
+              }) {
+                  Loaded(infoR) { info ->
+                      LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
+                          item {
+                              Column(Modifier.padding(16.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Surf).padding(16.dp)) {
+                                  Text(info.optString("ServerName", "Jellyfin"), fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                  Text(
+                                      listOfNotNull(
+                                          "Jellyfin " + info.optString("Version"),
+                                          info.s("OperatingSystemDisplayName") ?: info.s("OperatingSystem")
+                                      ).joinToString("  ·  "),
+                                      color = Muted, fontSize = 13.sp
+                                  )
+                                  info.s("LocalAddress")?.let { Text(it, color = Muted, fontSize = 12.sp) }
+                                  if (info.optBoolean("HasPendingRestart")) {
+                                      Spacer(Modifier.height(10.dp))
+                                      Row(verticalAlignment = Alignment.CenterVertically) {
+                                          Pill("RESTART NEEDED", Warn)
+                                          TextButton(onClick = { confirmRestart = true }) { Text("Restart now") }
+                                      }
+                                  }
+                              }
+                          }
+                          item {
+                              val c = countsR.orNull()
+                              val tiles = buildList {
+                                  add(Triple("Watching now", playing.size.toString(), if (playing.isNotEmpty()) Good else Color.White))
+                                  add(Triple("Transcoding", transcoding.toString(), if (transcoding > 0) Warn else Color.White))
+                                  add(Triple("Users", (usersR.orNull()?.size ?: 0).toString(), Color.White))
+                                  if (c != null) {
+                                      listOf("MovieCount" to "Movies", "SeriesCount" to "Shows", "EpisodeCount" to "Episodes", "BookCount" to "Books", "SongCount" to "Songs", "AlbumCount" to "Albums").forEach { (k, label) ->
+                                          val n = c.optInt(k, 0)
+                                          if (n > 0) add(Triple(label, String.format("%,d", n), Color.White))
+                                      }
+                                  }
+                              }
+                              Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  tiles.chunked(3).forEach { row ->
+                                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                          row.forEach { (label, value, accent) -> StatTile(label, value, Modifier.weight(1f), accent) }
+                                          repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                                      }
+                                  }
+                              }
+                          }
+                          item { SectionTitle("NOW PLAYING") }
+                          if (playing.isEmpty()) {
+                              item { Text("Nobody is watching right now.", color = Muted, modifier = Modifier.padding(horizontal = 16.dp)) }
+                          } else {
+                              items(playing, key = { it.optString("Id") }) { SessionCard(it) { bump++ } }
+                          }
+                          item { SectionTitle("MANAGE") }
+                          item { AdminRow(Icons.Filled.Devices, "Active sessions", "${sessions.size} signed in recently") { nav.navigate("admin/sessions") } }
+                          item { AdminRow(Icons.Filled.People, "Users", "Add people, change what they can do") { nav.navigate("admin/users") } }
+                          item { AdminRow(Icons.Filled.VideoLibrary, "Libraries", "Scan for new files") { nav.navigate("admin/libraries") } }
+                          item { AdminRow(Icons.Filled.Schedule, "Scheduled tasks", "Run or stop background jobs") { nav.navigate("admin/tasks") } }
+                          item { AdminRow(Icons.Filled.History, "Activity log", "Sign-ins, playback, failures") { nav.navigate("admin/activity") } }
+                          item { AdminRow(Icons.Filled.PhoneAndroid, "Devices & API keys", "Remove devices, create keys") { nav.navigate("admin/devices") } }
+                          item { AdminRow(Icons.Filled.Dns, "Server", "Logs, restart, shut down") { nav.navigate("admin/server") } }
+                      }
+                  }
+              }
+              if (confirmRestart) {
+                  ConfirmDialog("Restart the server?", "Everyone watching will be interrupted for a minute.", "Restart", danger = true, onConfirm = {
+                      scope.launch { doAdmin(ctx, "Restarting…") { Adm.restart() } }
+                  }, onDismiss = { confirmRestart = false })
+              }
+          }
+
+          @Composable
+          fun SessionCard(s: JSONObject, onChanged: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val id = s.optString("Id")
+              val npj = s.optJSONObject("NowPlayingItem")
+              val np = npj?.let { Item(it) }
+              val ps = s.optJSONObject("PlayState")
+              val paused = ps?.optBoolean("IsPaused") ?: false
+              val method = ps?.optString("PlayMethod") ?: ""
+              val tc = s.optJSONObject("TranscodingInfo")
+              var stopAsk by remember { mutableStateOf(false) }
+              var msg by remember { mutableStateOf(false) }
+              val pos = ps?.optLong("PositionTicks", 0L) ?: 0L
+              val progress = if (np != null && np.runTicks > 0) (pos.toFloat() / np.runTicks).coerceIn(0f, 1f) else 0f
+
+              Column(Modifier.padding(horizontal = 16.dp, vertical = 6.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Surf).padding(12.dp)) {
+                  Row {
+                      if (np != null) {
+                          Box(Modifier.width(110.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(6.dp)).background(Bg)) {
+                              AsyncImage(model = Jf.thumb(np, 400), contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                          }
+                          Spacer(Modifier.width(12.dp))
+                      }
+                      Column(Modifier.weight(1f)) {
+                          Text(s.optString("UserName", "Unknown user"), color = Color.White, fontWeight = FontWeight.Bold)
+                          Text(
+                              listOfNotNull(s.s("DeviceName"), s.s("Client")).joinToString(" · "),
+                              color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                          )
+                          if (np != null) {
+                              Text(
+                                  (np.seriesName?.let { "$it  ${np.episodeLabel ?: ""}  " } ?: "") + np.name,
+                                  color = Color.White, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
+                              )
+                          }
+                      }
+                  }
+                  if (np != null) {
+                      Spacer(Modifier.height(8.dp))
+                      ProgressLine(progress)
+                      Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Text("${clock(pos / 10_000)} / ${clock(np.runTicks / 10_000)}", color = Muted, fontSize = 12.sp)
+                          if (paused) Pill("PAUSED", Muted)
+                          when (method) {
+                              "Transcode" -> Pill("TRANSCODING", Warn)
+                              "DirectStream" -> Pill("DIRECT STREAM", Good)
+                              "DirectPlay" -> Pill("DIRECT PLAY", Good)
+                          }
+                      }
+                      if (method == "Transcode" && tc != null) {
+                          val reasons = tc.optJSONArray("TranscodeReasons").strs().joinToString(", ") {
+                              it.replace(Regex("([a-z])([A-Z])"), "$1 $2").lowercase()
+                          }
+                          val detail = listOfNotNull(
+                              tc.s("VideoCodec")?.let { v -> if (tc.optBoolean("IsVideoDirect")) "$v (copy)" else v },
+                              tc.s("AudioCodec"),
+                              tc.optLong("Bitrate", 0L).takeIf { it > 0 }?.let { mbps(it) }
+                          ).joinToString(" · ")
+                          Text(detail, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                          if (reasons.isNotBlank()) Text("Why: $reasons", color = Warn, fontSize = 12.sp)
+                      }
+                  }
+                  Text(
+                      listOfNotNull(s.s("RemoteEndPoint"), ago(s.s("LastActivityDate")).ifBlank { null }).joinToString(" · "),
+                      color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)
+                  )
+                  Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                      if (np != null) {
+                          TextButton(onClick = { scope.launch { if (doAdmin(ctx, if (paused) "Resumed" else "Paused") { Adm.pauseSession(id, !paused) }) onChanged() } }) {
+                              Icon(if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause, null, modifier = Modifier.size(18.dp))
+                              Spacer(Modifier.width(4.dp))
+                              Text(if (paused) "Resume" else "Pause")
+                          }
+                          TextButton(onClick = { stopAsk = true }) {
+                              Icon(Icons.Filled.Stop, null, tint = Danger, modifier = Modifier.size(18.dp))
+                              Spacer(Modifier.width(4.dp))
+                              Text("Stop", color = Danger)
+                          }
+                      }
+                      if (s.optBoolean("SupportsRemoteControl")) {
+                          TextButton(onClick = { msg = true }) {
+                              Icon(Icons.Filled.Message, null, modifier = Modifier.size(18.dp))
+                              Spacer(Modifier.width(4.dp))
+                              Text("Message")
+                          }
+                      }
+                  }
+              }
+              if (stopAsk) {
+                  ConfirmDialog("Stop this stream?", "${s.optString("UserName")}'s playback will end.", "Stop", danger = true, onConfirm = {
+                      scope.launch { if (doAdmin(ctx, "Stopped") { Adm.stopSession(id) }) onChanged() }
+                  }, onDismiss = { stopAsk = false })
+              }
+              if (msg) {
+                  var text by remember { mutableStateOf("") }
+                  AlertDialog(
+                      onDismissRequest = { msg = false },
+                      title = { Text("Message ${s.optString("UserName")}") },
+                      text = {
+                          OutlinedTextField(value = text, onValueChange = { text = it }, label = { Text("Message") }, modifier = Modifier.fillMaxWidth())
+                      },
+                      confirmButton = {
+                          TextButton(enabled = text.isNotBlank(), onClick = {
+                              val t = text.trim()
+                              msg = false
+                              scope.launch { doAdmin(ctx, "Sent") { Adm.message(id, "Message from the admin", t) } }
+                          }) { Text("Send") }
+                      },
+                      dismissButton = { TextButton(onClick = { msg = false }) { Text("Cancel") } }
+                  )
+              }
+          }
+
+          @Composable
+          fun SessionsScreen() {
+              var bump by remember { mutableIntStateOf(0) }
+              val r by rememberPoll(5000, bump) { Adm.sessions().sortedByDescending { it.s("LastActivityDate") ?: "" } }
+              AdminScaffold("Active sessions") {
+                  Loaded(r) { list ->
+                      if (list.isEmpty()) {
+                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No one has been active recently.", color = Muted) }
+                      } else {
+                          LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
+                              items(list, key = { it.optString("Id") }) { SessionCard(it) { bump++ } }
+                          }
+                      }
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+      - name: Write AdminServer.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/AdminServer.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.launch
+
+          // ---------------------------------------------------------------- libraries
+
+          @Composable
+          fun AdminLibrariesScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val r by rememberLoad(cacheKey = "admin:libs") { Adm.libraries() }
+              AdminScaffold("Libraries") {
+                  Loaded(r) { list ->
+                      LazyColumn(Modifier.fillMaxSize()) {
+                          item {
+                              Button(
+                                  onClick = { scope.launch { doAdmin(ctx, "Scan started") { Adm.scanAll() } } },
+                                  modifier = Modifier.padding(16.dp).fillMaxWidth()
+                              ) { Icon(Icons.Filled.Refresh, null); Spacer(Modifier.width(8.dp)); Text("Scan all libraries") }
+                          }
+                          items(list, key = { it.optString("ItemId") }) { lib ->
+                              val paths = lib.optJSONArray("Locations").strs()
+                              ListItem(
+                                  headlineContent = { Text(lib.optString("Name")) },
+                                  supportingContent = {
+                                      Text(
+                                          (listOfNotNull(lib.s("CollectionType")) + paths).joinToString("\n"),
+                                          fontSize = 12.sp
+                                      )
+                                  },
+                                  trailingContent = {
+                                      TextButton(onClick = {
+                                          scope.launch { doAdmin(ctx, "Refreshing ${lib.optString("Name")}") { Adm.refreshLibrary(lib.optString("ItemId")) } }
+                                      }) { Text("Scan") }
+                                  },
+                                  colors = ListItemDefaults.colors(containerColor = Bg)
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- tasks
+
+          @Composable
+          fun AdminTasksScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var bump by remember { mutableIntStateOf(0) }
+              val r by rememberPoll(4000, bump) { Adm.tasks() }
+              AdminScaffold("Scheduled tasks") {
+                  Loaded(r) { list ->
+                      val sorted = list.sortedWith(compareBy({ it.optString("State") != "Running" }, { it.optString("Category") }, { it.optString("Name") }))
+                      LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
+                          items(sorted, key = { it.optString("Id") }) { t ->
+                              val running = t.optString("State") == "Running"
+                              val id = t.optString("Id")
+                              val result = t.optJSONObject("LastExecutionResult")
+                              val status = result?.optString("Status") ?: ""
+                              ListItem(
+                                  headlineContent = { Text(t.optString("Name")) },
+                                  supportingContent = {
+                                      Column {
+                                          Text(t.optString("Description"), fontSize = 12.sp, maxLines = 2)
+                                          if (running) {
+                                              val p = t.optDouble("CurrentProgressPercentage", 0.0)
+                                              Spacer(Modifier.height(6.dp))
+                                              ProgressLine((p / 100.0).toFloat().coerceIn(0f, 1f))
+                                              Text("${p.toInt()}%", fontSize = 11.sp, color = Muted)
+                                          } else if (result != null) {
+                                              val whenText = ago(result.s("EndTimeUtc"))
+                                              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                  if (status.isNotBlank()) Pill(status.uppercase(), if (status == "Completed") Good else if (status == "Failed") Danger else Muted)
+                                                  if (whenText.isNotBlank()) Text(whenText, fontSize = 11.sp, color = Muted)
+                                              }
+                                          }
+                                      }
+                                  },
+                                  trailingContent = {
+                                      if (running) {
+                                          IconButton(onClick = { scope.launch { doAdmin(ctx, "Stopping") { Adm.stopTask(id) }; bump++ } }) {
+                                              Icon(Icons.Filled.Stop, "Stop", tint = Danger)
+                                          }
+                                      } else {
+                                          IconButton(onClick = { scope.launch { doAdmin(ctx, "Started") { Adm.runTask(id) }; bump++ } }) {
+                                              Icon(Icons.Filled.PlayArrow, "Run now")
+                                          }
+                                      }
+                                  },
+                                  colors = ListItemDefaults.colors(containerColor = Bg)
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- activity
+
+          @Composable
+          fun AdminActivityScreen() {
+              val r by rememberLoad(cacheKey = "admin:activity") { Adm.activity(100) }
+              val usersR by rememberLoad(cacheKey = "admin:users") { Adm.users() }
+              val names = remember(usersR) { usersR.orNull()?.associate { it.optString("Id") to it.optString("Name") } ?: emptyMap() }
+              AdminScaffold("Activity log") {
+                  Loaded(r) { list ->
+                      LazyColumn(Modifier.fillMaxSize()) {
+                          items(list, key = { it.optString("Id") }) { e ->
+                              val sev = e.optString("Severity")
+                              val color = when (sev) { "Error", "Fatal" -> Danger; "Warning" -> Warn; else -> Muted }
+                              val who = names[e.optString("UserId")]
+                              ListItem(
+                                  headlineContent = { Text(e.optString("Name"), fontSize = 14.sp) },
+                                  supportingContent = {
+                                      Text(
+                                          listOfNotNull(who, e.s("ShortOverview"), ago(e.s("Date")).ifBlank { null }).joinToString(" · "),
+                                          fontSize = 12.sp
+                                      )
+                                  },
+                                  leadingContent = { Icon(Icons.Filled.Circle, null, tint = color, modifier = Modifier.size(10.dp)) },
+                                  colors = ListItemDefaults.colors(containerColor = Bg)
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- devices and keys
+
+          @Composable
+          fun AdminDevicesScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val clip = LocalClipboardManager.current
+              var bump by remember { mutableIntStateOf(0) }
+              var tab by remember { mutableIntStateOf(0) }
+              val devR by rememberLoad(bump) { Adm.devices() }
+              val keyR by rememberLoad(bump) { Adm.keys() }
+              var delDevice by remember { mutableStateOf<String?>(null) }
+              var delKey by remember { mutableStateOf<String?>(null) }
+              var newKey by remember { mutableStateOf(false) }
+
+              AdminScaffold("Devices & API keys", actions = {
+                  if (tab == 1) IconButton(onClick = { newKey = true }) { Icon(Icons.Filled.Add, "New key") }
+              }) {
+                  TabRow(selectedTabIndex = tab, containerColor = Bg) {
+                      Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Devices") })
+                      Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("API keys") })
+                  }
+                  if (tab == 0) {
+                      Loaded(devR) { list ->
+                          LazyColumn(Modifier.fillMaxSize()) {
+                              items(list.sortedByDescending { it.s("DateLastActivity") ?: "" }, key = { it.optString("Id") }) { d ->
+                                  ListItem(
+                                      headlineContent = { Text(d.optString("Name")) },
+                                      supportingContent = {
+                                          Text(
+                                              listOfNotNull(d.s("AppName"), d.s("LastUserName"), ago(d.s("DateLastActivity")).ifBlank { null }).joinToString(" · "),
+                                              fontSize = 12.sp
+                                          )
+                                      },
+                                      trailingContent = {
+                                          IconButton(onClick = { delDevice = d.optString("Id") }) { Icon(Icons.Filled.Delete, "Remove", tint = Danger) }
+                                      },
+                                      colors = ListItemDefaults.colors(containerColor = Bg)
+                                  )
+                              }
+                          }
+                      }
+                  } else {
+                      Loaded(keyR) { list ->
+                          if (list.isEmpty()) {
+                              Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No API keys yet.", color = Muted) }
+                          } else {
+                              LazyColumn(Modifier.fillMaxSize()) {
+                                  items(list, key = { it.optString("AccessToken") }) { k ->
+                                      val token = k.optString("AccessToken")
+                                      ListItem(
+                                          headlineContent = { Text(k.optString("AppName")) },
+                                          supportingContent = {
+                                              Text(token.take(8) + "…  ·  created " + ago(k.s("DateCreated")), fontSize = 12.sp)
+                                          },
+                                          trailingContent = {
+                                              Row {
+                                                  IconButton(onClick = { clip.setText(AnnotatedString(token)); toast(ctx, "Copied") }) { Icon(Icons.Filled.ContentCopy, "Copy") }
+                                                  IconButton(onClick = { delKey = token }) { Icon(Icons.Filled.Delete, "Revoke", tint = Danger) }
+                                              }
+                                          },
+                                          colors = ListItemDefaults.colors(containerColor = Bg)
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              delDevice?.let { id ->
+                  ConfirmDialog("Remove this device?", "It will have to sign in again.", "Remove", danger = true, onConfirm = {
+                      scope.launch { if (doAdmin(ctx, "Removed") { Adm.deleteDevice(id) }) bump++ }
+                  }, onDismiss = { delDevice = null })
+              }
+              delKey?.let { key ->
+                  ConfirmDialog("Revoke this key?", "Anything using it will stop working.", "Revoke", danger = true, onConfirm = {
+                      scope.launch { if (doAdmin(ctx, "Revoked") { Adm.deleteKey(key) }) bump++ }
+                  }, onDismiss = { delKey = null })
+              }
+              if (newKey) {
+                  var app by remember { mutableStateOf("") }
+                  AlertDialog(
+                      onDismissRequest = { newKey = false },
+                      title = { Text("New API key") },
+                      text = { OutlinedTextField(app, { app = it }, singleLine = true, label = { Text("What is it for?") }) },
+                      confirmButton = {
+                          TextButton(enabled = app.isNotBlank(), onClick = {
+                              val a = app.trim()
+                              newKey = false
+                              scope.launch { if (doAdmin(ctx, "Key created") { Adm.createKey(a) }) bump++ }
+                          }) { Text("Create") }
+                      },
+                      dismissButton = { TextButton(onClick = { newKey = false }) { Text("Cancel") } }
+                  )
+              }
+          }
+
+          // ---------------------------------------------------------------- server and logs
+
+          @Composable
+          fun AdminServerScreen() {
+              val nav = LocalNav.current
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val logs by rememberLoad(cacheKey = "admin:logs") { Adm.logFiles() }
+              var restart by remember { mutableStateOf(false) }
+              var shut by remember { mutableStateOf(false) }
+
+              AdminScaffold("Server") {
+                  LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
+                      item { SectionTitle("POWER") }
+                      item {
+                          TextButton(onClick = { restart = true }, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Restart server") }
+                      }
+                      item {
+                          TextButton(onClick = { shut = true }, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Shut down server", color = Danger) }
+                      }
+                      item { SectionTitle("LOGS") }
+                      when (val l = logs) {
+                          is Res.Ok -> items(l.v.sortedByDescending { it.s("DateModified") ?: "" }, key = { it.optString("Name") }) { f ->
+                              val kb = f.optLong("Size", 0L) / 1024
+                              AdminRow(
+                                  Icons.Filled.Description, f.optString("Name"),
+                                  (if (kb >= 1024) "${kb / 1024} MB" else "$kb KB") + " · " + ago(f.s("DateModified"))
+                              ) { nav.navigate("admin/log/" + android.net.Uri.encode(f.optString("Name"))) }
+                          }
+                          is Res.Err -> item { Text(l.e.message ?: "Couldn't load logs", color = Muted, modifier = Modifier.padding(16.dp)) }
+                          else -> item { Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Purple) } }
+                      }
+                  }
+              }
+              if (restart) {
+                  ConfirmDialog("Restart the server?", "Everyone watching will be interrupted for a minute.", "Restart", danger = true, onConfirm = {
+                      scope.launch { doAdmin(ctx, "Restarting…") { Adm.restart() } }
+                  }, onDismiss = { restart = false })
+              }
+              if (shut) {
+                  ConfirmDialog(
+                      "Shut down the server?", "It will stay off until someone starts it again on the machine it runs on.",
+                      "Shut down", danger = true, onConfirm = {
+                          scope.launch { doAdmin(ctx, "Shutting down…") { Adm.shutdown() } }
+                      }, onDismiss = { shut = false }
+                  )
+              }
+          }
+
+          @Composable
+          fun AdminLogScreen(name: String) {
+              var bump by remember { mutableIntStateOf(0) }
+              val r by rememberLoad(name, bump) { Adm.logTail(name) }
+              AdminScaffold(name, actions = {
+                  IconButton(onClick = { bump++ }) { Icon(Icons.Filled.Refresh, "Reload") }
+              }) {
+                  Loaded(r) { text ->
+                      val v = rememberScrollState()
+                      val h = rememberScrollState()
+                      LaunchedEffect(text) { v.scrollTo(v.maxValue) }
+                      Text(
+                          text,
+                          fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Color(0xFFD0D0D8), softWrap = false,
+                          modifier = Modifier.fillMaxSize().verticalScroll(v).horizontalScroll(h).padding(8.dp)
+                      )
+                  }
+              }
+          }
+          FEYNOS_EOF
+
+      - name: Write AdminUi.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/AdminUi.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.delay
+
+          val Danger = Color(0xFFE5484D)
+          val Good = Color(0xFF30A46C)
+          val Warn = Color(0xFFF5A524)
+
+          /** Like [rememberLoad], but keeps refreshing every [periodMs] while the screen is open, for live views. */
+          @Composable
+          fun <T> rememberPoll(periodMs: Long, vararg keys: Any?, block: suspend () -> T): State<Res<T>> {
+              val tick = Session.tick
+              return produceState<Res<T>>(Res.Loading, *keys, tick) {
+                  while (true) {
+                      try {
+                          value = Res.Ok(block())
+                      } catch (e: CancellationException) {
+                          throw e
+                      } catch (e: Exception) {
+                          if (value !is Res.Ok) value = Res.Err(e)
+                      }
+                      delay(periodMs)
+                  }
+              }
+          }
+
+          @Composable
+          fun AdminScaffold(title: String, actions: @Composable RowScope.() -> Unit = {}, content: @Composable ColumnScope.() -> Unit) {
+              Column(Modifier.fillMaxSize().background(Bg)) {
+                  SubTopBar(title, actions)
+                  content()
+              }
+          }
+
+          @Composable
+          fun SectionTitle(text: String) {
+              Text(text, color = Purple, fontWeight = FontWeight.Bold, fontSize = 14.sp, modifier = Modifier.padding(16.dp, 20.dp, 16.dp, 6.dp))
+          }
+
+          @Composable
+          fun StatTile(label: String, value: String, modifier: Modifier = Modifier, accent: Color = Color.White) {
+              Column(modifier.clip(RoundedCornerShape(10.dp)).background(Surf).padding(12.dp)) {
+                  Text(value, color = accent, fontSize = 22.sp, fontWeight = FontWeight.Black)
+                  Text(label, color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+              }
+          }
+
+          @Composable
+          fun AdminRow(icon: ImageVector, title: String, subtitle: String?, onClick: () -> Unit) {
+              val colors = ListItemDefaults.colors(containerColor = Bg)
+              if (subtitle != null) {
+                  ListItem(
+                      headlineContent = { Text(title) },
+                      supportingContent = { Text(subtitle) },
+                      leadingContent = { Icon(icon, null) },
+                      trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+                      colors = colors,
+                      modifier = Modifier.clickable(onClick = onClick)
+                  )
+              } else {
+                  ListItem(
+                      headlineContent = { Text(title) },
+                      leadingContent = { Icon(icon, null) },
+                      trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+                      colors = colors,
+                      modifier = Modifier.clickable(onClick = onClick)
+                  )
+              }
+          }
+
+          @Composable
+          fun Pill(text: String, color: Color) {
+              Text(
+                  text, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                  modifier = Modifier.background(color, RoundedCornerShape(4.dp)).padding(horizontal = 6.dp, vertical = 2.dp)
+              )
+          }
+
+          @Composable
+          fun ConfirmDialog(title: String, text: String, confirm: String, danger: Boolean = false, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(title) },
+                  text = { Text(text) },
+                  confirmButton = {
+                      TextButton(onClick = { onConfirm(); onDismiss() }) { Text(confirm, color = if (danger) Danger else Purple) }
+                  },
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+              )
+          }
+
+          /** Runs a server action, then tells you how it went. */
+          suspend fun doAdmin(ctx: android.content.Context, done: String, block: suspend () -> Unit): Boolean = try {
+              block()
+              toast(ctx, done)
+              true
+          } catch (e: CancellationException) {
+              throw e
+          } catch (e: ApiException) {
+              toast(ctx, if (e.code == 403 || e.code == 401) "The server says you're not allowed to do that." else "Failed: ${e.message}")
+              false
+          } catch (e: Exception) {
+              toast(ctx, "Failed: ${e.message ?: "couldn't reach the server"}")
+              false
+          }
+          FEYNOS_EOF
+
+      - name: Write AdminUsers.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/AdminUsers.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Add
+          import androidx.compose.material.icons.filled.Person
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.launch
+
+          @Composable
+          fun UsersScreen() {
+              val nav = LocalNav.current
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var bump by remember { mutableIntStateOf(0) }
+              val r by rememberLoad(bump, cacheKey = "admin:users") { Adm.users() }
+              var adding by remember { mutableStateOf(false) }
+
+              AdminScaffold("Users", actions = {
+                  IconButton(onClick = { adding = true }) { Icon(Icons.Filled.Add, "Add user") }
+              }) {
+                  Loaded(r) { list ->
+                      LazyColumn(Modifier.fillMaxSize()) {
+                          items(list.sortedBy { it.optString("Name").lowercase() }, key = { it.optString("Id") }) { u ->
+                              val pol = u.optJSONObject("Policy")
+                              val tags = listOfNotNull(
+                                  if (pol?.optBoolean("IsAdministrator") == true) "Admin" else null,
+                                  if (pol?.optBoolean("IsDisabled") == true) "Disabled" else null
+                              )
+                              val last = ago(u.s("LastActivityDate"))
+                              AdminRow(
+                                  Icons.Filled.Person, u.optString("Name"),
+                                  (tags + listOf(if (last.isBlank()) "never active" else "active $last")).joinToString(" · ")
+                              ) { nav.navigate("admin/user/" + u.optString("Id")) }
+                          }
+                      }
+                  }
+              }
+              if (adding) {
+                  var name by remember { mutableStateOf("") }
+                  var pw by remember { mutableStateOf("") }
+                  AlertDialog(
+                      onDismissRequest = { adding = false },
+                      title = { Text("New user") },
+                      text = {
+                          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true)
+                              OutlinedTextField(
+                                  pw, { pw = it }, label = { Text("Password (optional)") }, singleLine = true,
+                                  visualTransformation = PasswordVisualTransformation()
+                              )
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(enabled = name.isNotBlank(), onClick = {
+                              val n = name.trim()
+                              val p = pw
+                              adding = false
+                              scope.launch { if (doAdmin(ctx, "Created $n") { Adm.createUser(n, p) }) bump++ }
+                          }) { Text("Create") }
+                      },
+                      dismissButton = { TextButton(onClick = { adding = false }) { Text("Cancel") } }
+                  )
+              }
+          }
+
+          private val FLAGS = listOf(
+              "IsAdministrator" to "Administrator",
+              "IsDisabled" to "Account disabled",
+              "EnableRemoteAccess" to "Can connect from outside the home network",
+              "EnableMediaPlayback" to "Can play media",
+              "EnableVideoPlaybackTranscoding" to "Can transcode video",
+              "EnableAudioPlaybackTranscoding" to "Can transcode audio",
+              "EnablePlaybackRemuxing" to "Can remux (direct stream)",
+              "EnableContentDownloading" to "Can download",
+              "EnableLiveTvAccess" to "Live TV access",
+              "EnableAllFolders" to "Access to all libraries"
+          )
+
+          @Composable
+          fun UserDetailScreen(id: String) {
+              val nav = LocalNav.current
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var bump by remember { mutableIntStateOf(0) }
+              val r by rememberLoad(id, bump) { Adm.user(id) }
+              var pwDialog by remember { mutableStateOf(false) }
+              var delAsk by remember { mutableStateOf(false) }
+              var clearAsk by remember { mutableStateOf(false) }
+              val busy = remember { mutableStateMapOf<String, Boolean>() }
+
+              AdminScaffold(r.orNull()?.optString("Name") ?: "User") {
+                  Loaded(r) { u ->
+                      val pol = u.optJSONObject("Policy")
+                      val isMe = id == Jf.uid
+                      LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
+                          item {
+                              val last = ago(u.s("LastActivityDate"))
+                              Text(
+                                  if (last.isBlank()) "Has never been active" else "Last active $last",
+                                  color = Muted, fontSize = 13.sp, modifier = Modifier.padding(16.dp, 12.dp, 16.dp, 0.dp)
+                              )
+                          }
+                          item { SectionTitle("PERMISSIONS") }
+                          items(FLAGS, key = { it.first }) { (key, label) ->
+                              val on = pol?.optBoolean(key) ?: false
+                              // Don't let admins lock themselves out by accident.
+                              val locked = isMe && (key == "IsAdministrator" || key == "IsDisabled")
+                              ListItem(
+                                  headlineContent = { Text(label) },
+                                  supportingContent = if (locked) ({ Text("Can't change your own", fontSize = 12.sp) }) else null,
+                                  trailingContent = {
+                                      Switch(
+                                          checked = on,
+                                          enabled = !locked && busy[key] != true,
+                                          onCheckedChange = { v ->
+                                              busy[key] = true
+                                              scope.launch {
+                                                  doAdmin(ctx, "Saved") { Adm.setPolicyFlag(id, key, v) }
+                                                  busy[key] = false
+                                                  bump++
+                                              }
+                                          }
+                                      )
+                                  },
+                                  colors = ListItemDefaults.colors(containerColor = Bg)
+                              )
+                          }
+                          item { SectionTitle("ACCOUNT") }
+                          item {
+                              TextButton(onClick = { pwDialog = true }, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Set a new password") }
+                          }
+                          item {
+                              TextButton(onClick = { clearAsk = true }, modifier = Modifier.padding(horizontal = 8.dp)) { Text("Remove password") }
+                          }
+                          if (!isMe) {
+                              item {
+                                  TextButton(onClick = { delAsk = true }, modifier = Modifier.padding(horizontal = 8.dp)) {
+                                      Text("Delete user", color = Danger)
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              if (pwDialog) {
+                  var pw by remember { mutableStateOf("") }
+                  AlertDialog(
+                      onDismissRequest = { pwDialog = false },
+                      title = { Text("New password") },
+                      text = {
+                          OutlinedTextField(
+                              pw, { pw = it }, singleLine = true, label = { Text("Password") },
+                              visualTransformation = PasswordVisualTransformation()
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(enabled = pw.isNotEmpty(), onClick = {
+                              val p = pw
+                              pwDialog = false
+                              scope.launch { doAdmin(ctx, "Password changed") { Adm.setPassword(id, p) } }
+                          }) { Text("Save") }
+                      },
+                      dismissButton = { TextButton(onClick = { pwDialog = false }) { Text("Cancel") } }
+                  )
+              }
+              if (clearAsk) {
+                  ConfirmDialog("Remove password?", "This account will be able to sign in without one.", "Remove", danger = true, onConfirm = {
+                      scope.launch { doAdmin(ctx, "Password removed") { Adm.clearPassword(id) } }
+                  }, onDismiss = { clearAsk = false })
+              }
+              if (delAsk) {
+                  ConfirmDialog("Delete this user?", "Their watch history and settings will be lost. Media files are not touched.", "Delete", danger = true, onConfirm = {
+                      scope.launch { if (doAdmin(ctx, "Deleted") { Adm.deleteUser(id) }) nav.popBackStack() }
+                  }, onDismiss = { delAsk = false })
+              }
+          }
+          FEYNOS_EOF
+
       - name: Write App.kt
         run: |
           set -e
@@ -3510,6 +4558,16 @@ jobs:
                           composable("downloads") { DownloadsScreen() }
                           composable("me") { MeScreen() }
                           composable("settings") { SettingsScreen() }
+                          composable("admin") { AdminHome() }
+                          composable("admin/sessions") { SessionsScreen() }
+                          composable("admin/users") { UsersScreen() }
+                          composable("admin/user/{id}") { b -> UserDetailScreen(b.arguments?.getString("id") ?: "") }
+                          composable("admin/libraries") { AdminLibrariesScreen() }
+                          composable("admin/tasks") { AdminTasksScreen() }
+                          composable("admin/activity") { AdminActivityScreen() }
+                          composable("admin/devices") { AdminDevicesScreen() }
+                          composable("admin/server") { AdminServerScreen() }
+                          composable("admin/log/{name}") { b -> AdminLogScreen(b.arguments?.getString("name") ?: "") }
                           composable("detail/{id}") { b -> DetailScreen(b.arguments?.getString("id") ?: "") }
                           composable("browse/{title}/{kind}/{arg}/{types}") { b ->
                               val a = b.arguments
@@ -5838,6 +6896,7 @@ jobs:
                   Jf.query(mapOf("Filters" to "IsFavorite", "IncludeItemTypes" to "Movie,Series,Episode", "SortBy" to "DateCreated", "SortOrder" to "Descending", "Limit" to 30)).first
               }
               val viewsR by rememberLoad(cacheKey = "views") { Jf.views() }
+              val adminR by rememberLoad(cacheKey = "isAdmin") { Adm.isAdmin() }
               var checking by remember { mutableStateOf(false) }
               val rowColors = ListItemDefaults.colors(containerColor = Bg)
 
@@ -5863,6 +6922,19 @@ jobs:
                               Spacer(Modifier.width(6.dp))
                               Text("Settings", color = Color.White)
                           }
+                      }
+                  }
+                  if (adminR.orNull() == true) {
+                      item {
+                          Spacer(Modifier.height(8.dp))
+                          ListItem(
+                              headlineContent = { Text("Admin dashboard") },
+                              supportingContent = { Text("Streams, users, libraries, server") },
+                              leadingContent = { Icon(Icons.Filled.AdminPanelSettings, null, tint = Purple) },
+                              trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+                              colors = rowColors,
+                              modifier = Modifier.clickable { nav.navigate("admin") }
+                          )
                       }
                   }
                   val favs = favR.orNull() ?: emptyList()
