@@ -6111,6 +6111,14 @@ jobs:
                               FilterChip(selected = filter == kind, onClick = { onFilter(if (filter == kind) null else kind) }, label = { Text(label) }, colors = chipColors)
                           }
                       }
+                      if (filter != null) {
+                          val label = when (filter) { "Series" -> "Shows"; "Movie" -> "Movies"; else -> "Books" }
+                          FilterChip(
+                              selected = false, onClick = { nav.navigate(browseRoute("All $label", "all", "_", filter)) },
+                              label = { Text("Browse all") },
+                              trailingIcon = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Color.White) }, colors = chipColors
+                          )
+                      }
                       FilterChip(
                           selected = false, onClick = onCats, label = { Text("Categories") },
                           trailingIcon = { Icon(Icons.Filled.ArrowDropDown, null, tint = Color.White) }, colors = chipColors
@@ -6191,6 +6199,12 @@ jobs:
                               item {
                                   Text("Home", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White,
                                       modifier = Modifier.clickable { onDismiss() }.padding(14.dp))
+                              }
+                              item {
+                                  Text("Browse everything", fontSize = 18.sp, color = Purple, fontWeight = FontWeight.Bold, modifier = Modifier.clickable {
+                                      onDismiss()
+                                      nav.navigate(browseRoute("Everything", "all", "_", types))
+                                  }.padding(14.dp))
                               }
                               items(list) { g ->
                                   Text(g, fontSize = 18.sp, color = Muted, modifier = Modifier.clickable {
@@ -6581,9 +6595,10 @@ jobs:
               var err by remember { mutableStateOf<String?>(null) }
               val grid = rememberLazyGridState()
               val scope = rememberCoroutineScope()
-              val genresR by rememberLoad(kind, arg) { if (kind == "lib") Jf.genres(types, arg) else emptyList() }
+              val genresR by rememberLoad(kind, arg) { if (kind == "lib") Jf.genres(types, arg) else if (kind == "all") Jf.genres(types) else emptyList() }
               val base: Map<String, Any?> = when (kind) {
                   "lib" -> mapOf("ParentId" to arg, "IncludeItemTypes" to types, "Recursive" to (types != null))
+                  "all" -> mapOf("IncludeItemTypes" to types, "Recursive" to true)
                   "genre" -> mapOf("Genres" to arg, "IncludeItemTypes" to types)
                   "person" -> mapOf("PersonIds" to arg, "IncludeItemTypes" to types)
                   else -> mapOf("Filters" to "IsFavorite", "IncludeItemTypes" to types)
