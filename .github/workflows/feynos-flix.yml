@@ -6544,18 +6544,39 @@ jobs:
 
           // ======================= BROWSE (library, genre, person, my list) =======================
 
+          private class SortOpt(val id: String, val label: String, val by: String, val asc: Boolean)
+
+          private val SORT_OPTS = listOf(
+              SortOpt("az", "Title A–Z", "SortName", true),
+              SortOpt("za", "Title Z–A", "SortName", false),
+              SortOpt("added", "Recently added", "DateCreated", false),
+              SortOpt("added_old", "Oldest added", "DateCreated", true),
+              SortOpt("year", "Release date (newest)", "PremiereDate", false),
+              SortOpt("year_old", "Release date (oldest)", "PremiereDate", true),
+              SortOpt("rating", "Top rated", "CommunityRating", false),
+              SortOpt("critic", "Critic score", "CriticRating", false),
+              SortOpt("runtime_long", "Longest first", "Runtime", false),
+              SortOpt("runtime_short", "Shortest first", "Runtime", true),
+              SortOpt("played", "Recently played", "DatePlayed", false),
+              SortOpt("random", "Surprise me", "Random", true)
+          )
+
+          private val STATUS_OPTS = listOf(null to "Everything", "IsUnplayed" to "Unwatched", "IsPlayed" to "Watched", "IsFavorite" to "Favorites")
+          private val LETTERS = listOf("All", "#") + ('A'..'Z').map { it.toString() }
+
           @Composable
           fun BrowseScreen(title: String, kind: String, arg: String, types: String?) {
-              val sorts = listOf(
-                  "DateCreated" to "Recently added", "SortName" to "A–Z", "PremiereDate" to "Release date",
-                  "CommunityRating" to "Top rated", "Random" to "Surprise me"
-              )
-              var sort by rememberSaveable { mutableStateOf(if (kind == "person") "PremiereDate" else "DateCreated") }
+              var sortId by rememberSaveable { mutableStateOf(if (kind == "person") "year" else "az") }
               var genre by rememberSaveable { mutableStateOf<String?>(null) }
+              var status by rememberSaveable { mutableStateOf<String?>(null) }
+              var letter by rememberSaveable { mutableStateOf("All") }
               var sortMenu by remember { mutableStateOf(false) }
+              var filterMenu by remember { mutableStateOf(false) }
+              val sort = SORT_OPTS.first { it.id == sortId }
+              val byName = sort.by == "SortName"
               val tick = Session.tick
-              val list = remember(kind, arg, sort, genre, tick) { mutableStateListOf<Item>() }
-              var total by remember(kind, arg, sort, genre, tick) { mutableIntStateOf(-1) }
+              val list = remember(kind, arg, sortId, genre, status, letter, tick) { mutableStateListOf<Item>() }
+              var total by remember(kind, arg, sortId, genre, status, letter, tick) { mutableIntStateOf(-1) }
               var loading by remember { mutableStateOf(false) }
               var err by remember { mutableStateOf<String?>(null) }
               val grid = rememberLazyGridState()
@@ -6574,12 +6595,16 @@ jobs:
                   scope.launch {
                       try {
                           val extra = mutableMapOf<String, Any?>(
-                              "SortBy" to "$sort,SortName",
-                              "SortOrder" to (if (sort == "SortName") "Ascending" else "Descending"),
+                              "SortBy" to (if (sort.by == "SortName" || sort.by == "Random") sort.by else "${sort.by},SortName"),
+                              "SortOrder" to (if (sort.asc) "Ascending" else "Descending"),
                               "StartIndex" to list.size,
                               "Limit" to 60
                           )
                           if (genre != null) extra["Genres"] = genre
+                          if (status != null && kind != "fav") extra["Filters"] = status
+                          if (byName && letter != "All") {
+                              if (letter == "#") extra["NameLessThan"] = "A" else extra["NameStartsWith"] = letter
+                          }
                           extra["Fields"] = Jf.CARD
                           val (l, t) = Jf.query(base + extra)
                           list.addAll(l)
@@ -6595,7 +6620,7 @@ jobs:
                   }
               }
 
-              LaunchedEffect(kind, arg, sort, genre, tick) {
+              LaunchedEffect(kind, arg, sortId, genre, status, letter, tick) {
                   loadMore()
                   snapshotFlow { grid.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
                       .distinctUntilChanged()
@@ -6604,14 +6629,30 @@ jobs:
 
               Column(Modifier.fillMaxSize().background(Bg)) {
                   SubTopBar(title) {
+                      if (kind != "fav") {
+                          Box {
+                              IconButton(onClick = { filterMenu = true }) {
+                                  Icon(Icons.Filled.Tune, "Filter", tint = if (status != null) Purple else LocalContentColor.current)
+                              }
+                              DropdownMenu(expanded = filterMenu, onDismissRequest = { filterMenu = false }) {
+                                  STATUS_OPTS.forEach { (k, l) ->
+                                      DropdownMenuItem(
+                                          text = { Text(l) },
+                                          onClick = { status = k; filterMenu = false },
+                                          trailingIcon = { if (status == k) Icon(Icons.Filled.Check, null) }
+                                      )
+                                  }
+                              }
+                          }
+                      }
                       Box {
-                          IconButton(onClick = { sortMenu = true }) { Icon(Icons.Filled.FilterList, "Sort") }
+                          IconButton(onClick = { sortMenu = true }) { Icon(Icons.Filled.SwapVert, "Sort") }
                           DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
-                              sorts.forEach { (k, l) ->
+                              SORT_OPTS.forEach { o ->
                                   DropdownMenuItem(
-                                      text = { Text(l) },
-                                      onClick = { sort = k; sortMenu = false },
-                                      trailingIcon = { if (sort == k) Icon(Icons.Filled.Check, null) }
+                                      text = { Text(o.label) },
+                                      onClick = { sortId = o.id; sortMenu = false; if (o.by != "SortName") letter = "All" },
+                                      trailingIcon = { if (sortId == o.id) Icon(Icons.Filled.Check, null) }
                                   )
                               }
                           }
@@ -6620,14 +6661,34 @@ jobs:
                   val gl = genresR.orNull() ?: emptyList()
                   if (gl.isNotEmpty()) {
                       LazyRow(contentPadding = PaddingValues(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                          item { FilterChip(selected = genre == null, onClick = { genre = null }, label = { Text("All") }) }
+                          item { FilterChip(selected = genre == null, onClick = { genre = null }, label = { Text("All genres") }) }
                           items(gl) { g -> FilterChip(selected = genre == g, onClick = { genre = if (genre == g) null else g }, label = { Text(g) }) }
                       }
+                  }
+                  if (byName) {
+                      LazyRow(contentPadding = PaddingValues(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                          items(LETTERS) { l ->
+                              Text(
+                                  l,
+                                  color = if (letter == l) Purple else Muted,
+                                  fontWeight = if (letter == l) FontWeight.Bold else FontWeight.Normal,
+                                  fontSize = 14.sp,
+                                  modifier = Modifier.clickable { letter = l }.padding(horizontal = 8.dp, vertical = 8.dp)
+                              )
+                          }
+                      }
+                  }
+                  if (total >= 0) {
+                      Text(
+                          String.format("%,d", total) + (if (total == 1) " item" else " items") + "  ·  " + sort.label +
+                              (STATUS_OPTS.firstOrNull { it.first == status && status != null }?.let { "  ·  " + it.second } ?: ""),
+                          color = Muted, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+                      )
                   }
                   when {
                       list.isEmpty() && err != null -> ErrorBox(err ?: "")
                       list.isEmpty() && total == 0 -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                          Text("Nothing here yet.", color = Muted)
+                          Text("Nothing here.", color = Muted)
                       }
                       else -> LazyVerticalGrid(
                           columns = GridCells.Adaptive(110.dp),
