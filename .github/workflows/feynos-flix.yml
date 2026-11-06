@@ -128,6 +128,7 @@ jobs:
               implementation("androidx.media3:media3-exoplayer:1.5.1")
               implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
               implementation("androidx.media3:media3-ui:1.5.1")
+              implementation("androidx.media3:media3-session:1.5.1")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
               implementation("com.github.junrar:junrar:7.5.5")
           }
@@ -4882,6 +4883,7 @@ jobs:
           import androidx.lifecycle.lifecycleScope
           import androidx.media3.common.AudioAttributes
           import androidx.media3.common.C
+          import androidx.media3.session.MediaSession
           import androidx.media3.common.Format
           import androidx.media3.common.MediaItem
           import androidx.media3.common.MimeTypes
@@ -4998,6 +5000,9 @@ jobs:
                   .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
                   .setHandleAudioBecomingNoisy(true)
                   .build()
+
+              // Registers the player with Android so headphone / Bluetooth / car play-pause, next and previous buttons reach it.
+              private val mediaSession: MediaSession = MediaSession.Builder(ctx, player).setId("feynosflix-player").build()
 
               var item by mutableStateOf<Item?>(null)
                   private set
@@ -5341,6 +5346,7 @@ jobs:
 
               fun release() {
                   endSession()
+                  mediaSession.release()
                   player.release()
               }
           }
