@@ -2726,6 +2726,140 @@ jobs:
           }
           FEYNOS_EOF
 
+      - name: Write EpisodeTools.kt
+        run: |
+          set -e
+          mkdir -p flix/app/src/main/java/com/feynos/flix
+          cat > 'flix/app/src/main/java/com/feynos/flix/EpisodeTools.kt' <<'FEYNOS_EOF'
+          package com.feynos.flix
+
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import org.json.JSONObject
+
+          fun fmtBytes(b: Long): String = when {
+              b >= 1L shl 30 -> String.format("%.2f GB", b / (1024.0 * 1024 * 1024))
+              b >= 1L shl 20 -> String.format("%.1f MB", b / (1024.0 * 1024))
+              else -> "${b / 1024} KB"
+          }
+
+          private fun bitrate(b: Long): String =
+              if (b >= 1_000_000) String.format("%.1f Mbps", b / 1_000_000.0) else "${b / 1000} kbps"
+
+          /** What you get when you press and hold an episode. */
+          @Composable
+          fun EpisodeMenu(
+              ep: Item, played: Boolean, downloaded: Boolean,
+              onTogglePlayed: () -> Unit, onInfo: () -> Unit, onDownload: () -> Unit, onDismiss: () -> Unit
+          ) {
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text((ep.index?.let { "$it. " } ?: "") + ep.name, maxLines = 2) },
+                  text = {
+                      Column {
+                          TextButton(onClick = { onDismiss(); onTogglePlayed() }, modifier = Modifier.fillMaxWidth()) {
+                              Text(if (played) "Mark as unwatched" else "Mark as watched", modifier = Modifier.fillMaxWidth())
+                          }
+                          TextButton(onClick = { onDismiss(); onInfo() }, modifier = Modifier.fillMaxWidth()) {
+                              Text("File info", modifier = Modifier.fillMaxWidth())
+                          }
+                          if (!downloaded) {
+                              TextButton(onClick = { onDismiss(); onDownload() }, modifier = Modifier.fillMaxWidth()) {
+                                  Text("Download", modifier = Modifier.fillMaxWidth())
+                              }
+                          }
+                      }
+                  },
+                  confirmButton = {},
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+              )
+          }
+
+          @Composable
+          private fun InfoLine(label: String, value: String?) {
+              if (value.isNullOrBlank()) return
+              Row(Modifier.padding(vertical = 2.dp)) {
+                  Text(label, color = Muted, fontSize = 12.sp, modifier = Modifier.width(92.dp))
+                  Text(value, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+              }
+          }
+
+          private fun streamLine(s: JSONObject): String {
+              val parts = mutableListOf<String>()
+              s.s("Language")?.let { parts += it }
+              s.s("Codec")?.let { parts += it.uppercase() }
+              if (s.optString("Type") == "Video") {
+                  val w = s.optInt("Width", 0)
+                  val h = s.optInt("Height", 0)
+                  if (w > 0 && h > 0) parts += "${w}×$h"
+                  val fps = s.optDouble("RealFrameRate", 0.0)
+                  if (!fps.isNaN() && fps > 0) parts += String.format("%.3f", fps).trimEnd('0').trimEnd('.') + " fps"
+                  s.s("VideoRangeType")?.takeIf { it != "SDR" }?.let { parts += it }
+                  s.optInt("BitDepth", 0).takeIf { it > 0 }?.let { parts += "$it-bit" }
+                  s.s("Profile")?.let { parts += it }
+              } else if (s.optString("Type") == "Audio") {
+                  s.s("ChannelLayout")?.let { parts += it }
+              }
+              val br = s.optLong("BitRate", 0L)
+              if (br > 0) parts += bitrate(br)
+              if (s.optBoolean("IsDefault")) parts += "default"
+              if (s.optBoolean("IsExternal")) parts += "external"
+              return parts.joinToString(" · ")
+          }
+
+          @Composable
+          fun FileInfoDialog(ep: Item, onDismiss: () -> Unit) {
+              val r by rememberLoad(ep.id) { Jf.item(ep.id).j }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text("File info") },
+                  text = {
+                      Column(Modifier.verticalScroll(rememberScrollState())) {
+                          when (val x = r) {
+                              is Res.Ok -> {
+                                  val sources = x.v.optJSONArray("MediaSources").objs()
+                                  if (sources.isEmpty()) Text("The server has no file details for this.", color = Muted)
+                                  sources.forEachIndexed { i, src ->
+                                      if (sources.size > 1) Text("Version ${i + 1}", fontWeight = FontWeight.Bold, color = Purple, modifier = Modifier.padding(top = 8.dp))
+                                      SelectionContainer {
+                                          Column {
+                                              InfoLine("Name", src.s("Name"))
+                                              InfoLine("Path", src.s("Path"))
+                                              InfoLine("Container", src.s("Container")?.uppercase())
+                                              InfoLine("Size", src.optLong("Size", 0L).takeIf { it > 0 }?.let { fmtBytes(it) })
+                                              InfoLine("Bitrate", src.optLong("Bitrate", 0L).takeIf { it > 0 }?.let { bitrate(it) })
+                                              InfoLine("Length", src.optLong("RunTimeTicks", 0L).takeIf { it > 0 }?.let { runtime(it) })
+                                          }
+                                      }
+                                      val streams = src.optJSONArray("MediaStreams").objs()
+                                      listOf("Video" to "Video", "Audio" to "Audio", "Subtitle" to "Subtitles").forEach { (type, label) ->
+                                          val list = streams.filter { it.optString("Type") == type }
+                                          if (list.isNotEmpty()) {
+                                              Text(label, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+                                              list.forEach { s -> Text("• " + streamLine(s), color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(vertical = 1.dp)) }
+                                          }
+                                      }
+                                  }
+                              }
+                              is Res.Err -> Text(x.e.message ?: "Couldn't load file info", color = Muted)
+                              else -> CircularProgressIndicator(color = Purple)
+                          }
+                      }
+                  },
+                  confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+              )
+          }
+          FEYNOS_EOF
+
       - name: Write Epub.kt
         run: |
           set -e
@@ -6274,7 +6408,8 @@ jobs:
                   }
               }
               val season = seasons.getOrNull(seasonIdx)
-              val episodesR by rememberLoad(season?.id, cacheKey = "eps:${season?.id}") { if (season != null) Jf.episodes(item.id, season.id) else emptyList() }
+              var epBump by remember { mutableIntStateOf(0) }
+              val episodesR by rememberLoad(season?.id, epBump, cacheKey = "eps:${season?.id}") { if (season != null) Jf.episodes(item.id, season.id) else emptyList() }
               val tabs = buildList {
                   if (isSeries) add("Episodes")
                   add("More Like This")
@@ -6402,6 +6537,25 @@ jobs:
                                   }
                               }
                           }
+                          item {
+                              Row(Modifier.padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                  val sid = season?.id
+                                  TextButton(enabled = sid != null, onClick = {
+                                      scope.launch {
+                                          runCatching { Jf.setPlayed(sid!!, true) }
+                                              .onSuccess { toast(ctx, "Season marked as watched"); epBump++ }
+                                              .onFailure { toast(ctx, "Couldn't update: ${it.message}") }
+                                      }
+                                  }) { Icon(Icons.Filled.CheckCircle, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("Season watched") }
+                                  TextButton(enabled = sid != null, onClick = {
+                                      scope.launch {
+                                          runCatching { Jf.setPlayed(sid!!, false) }
+                                              .onSuccess { toast(ctx, "Season marked as unwatched"); epBump++ }
+                                              .onFailure { toast(ctx, "Couldn't update: ${it.message}") }
+                                      }
+                                  }) { Text("Unwatched") }
+                              }
+                          }
                           when (val er = episodesR) {
                               is Res.Ok -> items(er.v) { EpisodeRow(it) }
                               is Res.Err -> item { Text(er.e.message ?: "Couldn't load episodes", color = Muted, modifier = Modifier.padding(16.dp)) }
@@ -6505,23 +6659,35 @@ jobs:
           }
 
           @Composable
+          @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
           fun EpisodeRow(ep: Item) {
               val ctx = LocalContext.current
               val scope = rememberCoroutineScope()
               val dl = Downloads.entries.any { it.id == ep.id }
-              Column(Modifier.fillMaxWidth().clickable { play(ctx, ep.id) }.padding(horizontal = 16.dp, vertical = 10.dp)) {
+              var played by remember(ep.id, ep.played) { mutableStateOf(ep.played) }
+              var menu by remember { mutableStateOf(false) }
+              var info by remember { mutableStateOf(false) }
+              val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+              Column(
+                  Modifier.fillMaxWidth()
+                      .combinedClickable(
+                          onClick = { play(ctx, ep.id) },
+                          onLongClick = { haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress); menu = true }
+                      )
+                      .padding(horizontal = 16.dp, vertical = 10.dp)
+              ) {
                   Row(verticalAlignment = Alignment.CenterVertically) {
                       Box(Modifier.width(140.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(6.dp)).background(Surf)) {
                           AsyncImage(model = Jf.thumb(ep, 480), contentDescription = ep.name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                           Icon(Icons.Filled.PlayCircleOutline, null, tint = Color.White, modifier = Modifier.align(Alignment.Center).size(34.dp))
-                          if (ep.progress > 0f && !ep.played) ProgressLine(ep.progress, Modifier.align(Alignment.BottomCenter))
+                          if (ep.progress > 0f && !played) ProgressLine(ep.progress, Modifier.align(Alignment.BottomCenter))
                       }
                       Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
                           val num = ep.index?.let { "$it. " } ?: ""
                           Text(num + ep.name, maxLines = 2, overflow = TextOverflow.Ellipsis, color = Color.White, fontSize = 15.sp)
                           Row(verticalAlignment = Alignment.CenterVertically) {
                               if (ep.runTicks > 0) Text(runtime(ep.runTicks), fontSize = 12.sp, color = Muted)
-                              if (ep.played) {
+                              if (played) {
                                   Spacer(Modifier.width(6.dp))
                                   Icon(Icons.Filled.CheckCircle, "Watched", tint = Purple, modifier = Modifier.size(14.dp))
                               }
@@ -6541,6 +6707,29 @@ jobs:
                       Text(it, fontSize = 13.sp, color = Muted, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 6.dp))
                   }
               }
+              if (menu) {
+                  EpisodeMenu(
+                      ep, played, dl,
+                      onTogglePlayed = {
+                          val want = !played
+                          scope.launch {
+                              runCatching { Jf.setPlayed(ep.id, want) }
+                                  .onSuccess { played = want; toast(ctx, if (want) "Marked as watched" else "Marked as unwatched") }
+                                  .onFailure { toast(ctx, "Couldn't update: ${it.message}") }
+                          }
+                      },
+                      onInfo = { info = true },
+                      onDownload = {
+                          scope.launch {
+                              runCatching { Downloads.start(ep) }
+                                  .onSuccess { toast(ctx, "Downloading ${ep.name}") }
+                                  .onFailure { toast(ctx, "Download failed: ${it.message}") }
+                          }
+                      },
+                      onDismiss = { menu = false }
+                  )
+              }
+              if (info) FileInfoDialog(ep) { info = false }
           }
 
           @Composable
